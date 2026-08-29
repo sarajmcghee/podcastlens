@@ -38,7 +38,7 @@ MAX_BYTES_PER_SEC = 40000   # 320 kbps
 # the cheap mistake.
 CONSERVATIVE_BYTES_PER_SEC = 8000
 
-HEADER_PADDING = 64 * 1024   # room for ID3 tags before the first audio frame
+SYNC_SCAN_BYTES = 8192   # how far past the ID3 tag to hunt for a frame sync
 
 
 class LimitedReader:
@@ -47,17 +47,25 @@ class LimitedReader:
     The Range header is a request, not a guarantee - some CDNs ignore it and
     start streaming the full four hour episode anyway. This enforces the ceiling
     on our side so a badly behaved origin cannot run us past the free tier.
+
+    `prefix` is served before the stream, so the caller can peek at the first
+    few kilobytes to find a frame boundary and still hand us the untouched
+    remainder.
     """
 
-    def __init__(self, stream, limit: int):
+    def __init__(self, stream, limit: int, prefix: bytes = b""):
         self._stream = stream
+        self._buffer = prefix
         self._remaining = limit
 
     def read(self, size: int = -1) -> bytes:
         if self._remaining <= 0:
             return b""
         want = self._remaining if size is None or size < 0 else min(size, self._remaining)
-        chunk = self._stream.read(want)
+        if self._buffer:
+            chunk, self._buffer = self._buffer[:want], self._buffer[want:]
+        else:
+            chunk = self._stream.read(want)
         self._remaining -= len(chunk)
         return chunk
 
@@ -76,7 +84,41 @@ def _clip_bytes(declared_duration: int, audio_bytes: int, clip_seconds: int) -> 
             bytes_per_sec = derived
         else:
             print(f"ignoring implausible bitrate {derived:.0f} B/s from feed metadata")
-    return min(int(bytes_per_sec * clip_seconds) + HEADER_PADDING, MAX_AUDIO_BYTES)
+    return min(int(bytes_per_sec * clip_seconds), MAX_AUDIO_BYTES)
+
+
+def _start_job(job_name: str, feed_id: str, episode_id: str, key: str, retried: bool = False):
+    """Start a Transcribe job, recovering from a leftover job of the same name.
+
+    Job names are unique per account per region and they persist after the job
+    ends - including when it FAILED. So a naive retry of a failed episode hits
+    ConflictException forever and the episode is stuck. Delete the corpse and
+    try once more.
+    """
+    try:
+        transcribe.start_transcription_job(
+            TranscriptionJobName=job_name,
+            LanguageCode="en-US",
+            MediaFormat="mp3",
+            Media={"MediaFileUri": f"s3://{MEDIA_BUCKET}/{key}"},
+            OutputBucketName=MEDIA_BUCKET,
+            OutputKey=f"transcripts/{feed_id}/{episode_id}.json",
+            Settings={"ShowSpeakerLabels": True, "MaxSpeakerLabels": 2},
+        )
+        return
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "ConflictException" or retried:
+            raise
+
+    existing = transcribe.get_transcription_job(
+        TranscriptionJobName=job_name)["TranscriptionJob"]["TranscriptionJobStatus"]
+    if existing in ("IN_PROGRESS", "QUEUED"):
+        # A redelivered SQS message for work already under way. Not an error.
+        print(f"job {job_name} is {existing} - treating as in flight")
+        return
+    print(f"job {job_name} is {existing}; deleting it and starting a fresh one")
+    transcribe.delete_transcription_job(TranscriptionJobName=job_name)
+    _start_job(job_name, feed_id, episode_id, key, retried=True)
 
 
 def _handle(msg: dict):
@@ -101,41 +143,42 @@ def _handle(msg: dict):
 
     update_episode(feed_id, sk, "DOWNLOADING")
 
-    limit = _clip_bytes(declared_duration, audio_bytes, clip_seconds)
+    # Read the ID3v2 header before anything else. Publishers embed chapter
+    # markers and artwork here, and the tag can be tens of megabytes - large
+    # enough to swallow an entire clip, leaving a file with no audio in it.
+    tag_size = rss.id3v2_size(rss.fetch_range(msg["audioUrl"], 0, 9))
+
+    # The enclosure length counts the tag too, so subtract it before deriving a
+    # bitrate or we would understate how dense the audio actually is.
+    audio_only_bytes = max(0, audio_bytes - tag_size)
+    limit = _clip_bytes(declared_duration, audio_only_bytes, clip_seconds)
+
     key = f"audio/{feed_id}/{episode_id}.mp3"
-    stream, length, ranged = rss.open_stream(msg["audioUrl"], byte_limit=limit)
+    stream, length, ranged = rss.open_stream(
+        msg["audioUrl"], byte_limit=limit + SYNC_SCAN_BYTES, start=tag_size)
+
+    # Start the upload exactly on a frame boundary; some files pad between the
+    # tag and the first frame.
+    head = stream.read(SYNC_SCAN_BYTES)
+    offset = rss.find_frame_sync(head)
     print(f"episode={episode_id} duration={duration}s clip={clip_seconds}s "
-          f"limit={limit}B server_length={length} ranged={ranged}")
+          f"id3_tag={tag_size}B limit={limit}B sync_at=+{offset}B "
+          f"server_length={length} ranged={ranged}")
+    if not head:
+        raise RuntimeError("origin returned no audio bytes after the ID3 tag")
 
     try:
         # upload_fileobj streams in parts; the whole file never sits in memory.
         s3.upload_fileobj(
-            LimitedReader(stream, limit), MEDIA_BUCKET, key,
-            ExtraArgs={"ContentType": "audio/mpeg"},
+            LimitedReader(stream, limit, prefix=head[offset:]),
+            MEDIA_BUCKET, key, ExtraArgs={"ContentType": "audio/mpeg"},
         )
     finally:
         stream.close()
     print(f"stored s3://{MEDIA_BUCKET}/{key}")
 
     job_name = f"pl-{feed_id}-{episode_id}"
-    try:
-        transcribe.start_transcription_job(
-            TranscriptionJobName=job_name,
-            LanguageCode="en-US",
-            MediaFormat="mp3",
-            Media={"MediaFileUri": f"s3://{MEDIA_BUCKET}/{key}"},
-            OutputBucketName=MEDIA_BUCKET,
-            OutputKey=f"transcripts/{feed_id}/{episode_id}.json",
-            Settings={"ShowSpeakerLabels": True, "MaxSpeakerLabels": 2},
-        )
-    except ClientError as exc:
-        # A duplicate job name means a retry re-delivered this message after the
-        # job already started. That is success, not failure - do not raise, or
-        # the message goes back on the queue forever.
-        if exc.response["Error"]["Code"] == "ConflictException":
-            print(f"job {job_name} already exists - treating as in flight")
-        else:
-            raise
+    _start_job(job_name, feed_id, episode_id, key)
 
     update_episode(feed_id, sk, "TRANSCRIBING", {
         "jobName": job_name,

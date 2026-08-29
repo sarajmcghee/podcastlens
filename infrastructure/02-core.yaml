@@ -331,7 +331,11 @@ Resources:
         - S3CrudPolicy: {BucketName: !Ref MediaBucket}
         - Statement:
             - Effect: Allow
-              Action: [transcribe:StartTranscriptionJob, transcribe:GetTranscriptionJob]
+              Action:
+                - transcribe:StartTranscriptionJob
+                - transcribe:GetTranscriptionJob
+                # Needed to clear a failed job of the same name before retrying.
+                - transcribe:DeleteTranscriptionJob
               # Scoped to job names this project creates, not every job in the
               # account. Least privilege is a habit, not a checkbox.
               Resource: !Sub "arn:${AWS::Partition}:transcribe:${AWS::Region}:${AWS::AccountId}:transcription-job/pl-*"
