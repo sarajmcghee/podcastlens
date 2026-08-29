@@ -212,7 +212,10 @@ Resources:
         MaxAge: 600
       AccessLogSettings:
         DestinationArn: !GetAtt ApiAccessLogs.Arn
-        Format: '{"time":"$context.requestTime","method":"$context.httpMethod","path":"$context.path","status":"$context.status","latency":"$context.responseLatency","error":"$context.error.message"}'
+        # API Gateway REJECTS an access log format that omits both
+        # $context.requestId and $context.extendedRequestId. Without a request
+        # id a log line cannot be correlated to anything, so this is enforced.
+        Format: '{"requestId":"$context.requestId","time":"$context.requestTime","method":"$context.httpMethod","path":"$context.path","status":"$context.status","latency":"$context.responseLatency","error":"$context.error.message"}'
 
   ApiAccessLogs:
     Type: AWS::Logs::LogGroup
