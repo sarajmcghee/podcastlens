@@ -60,6 +60,10 @@ def lambda_handler(event, context):
                     "publishedAt": ep["publishedAt"],
                     "audioUrl": ep["audioUrl"],
                     "durationSeconds": ep["durationSeconds"],
+                    # The processor needs this to derive the real bitrate.
+                    # Omitting it silently fell back to the conservative
+                    # estimate, producing a clip well short of CLIP_SECONDS.
+                    "audioBytes": ep["audioBytes"],
                     "title": ep["title"],
                 }),
             )

@@ -16,7 +16,7 @@ def fetch(url: str, timeout: int = 20) -> bytes:
         return resp.read()
 
 
-def open_stream(url: str, timeout: int = 60, byte_limit: int = 0):
+def open_stream(url: str, timeout: int = 60, byte_limit: int = 0, start: int = 0):
     """Return a file-like object for the audio, plus its declared length.
 
     We hand this straight to S3's upload_fileobj so the episode is streamed
@@ -30,7 +30,9 @@ def open_stream(url: str, timeout: int = 60, byte_limit: int = 0):
     """
     headers = {"User-Agent": USER_AGENT}
     if byte_limit > 0:
-        headers["Range"] = f"bytes=0-{byte_limit - 1}"
+        headers["Range"] = f"bytes={start}-{start + byte_limit - 1}"
+    elif start > 0:
+        headers["Range"] = f"bytes={start}-"
     req = urllib.request.Request(url, headers=headers)
     resp = urllib.request.urlopen(req, timeout=timeout)
     length = int(resp.headers.get("Content-Length") or 0)
@@ -38,6 +40,48 @@ def open_stream(url: str, timeout: int = 60, byte_limit: int = 0):
     # sending the whole file, which the caller needs to know about.
     ranged = resp.status == 206
     return resp, length, ranged
+
+
+def fetch_range(url: str, start: int, end: int, timeout: int = 20) -> bytes:
+    """Fetch one small byte range. Used to read an MP3's ID3 header."""
+    req = urllib.request.Request(url, headers={
+        "User-Agent": USER_AGENT, "Range": f"bytes={start}-{end}"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def id3v2_size(head: bytes) -> int:
+    """Total size of a leading ID3v2 tag, header included. 0 if there is none.
+
+    This matters more than it sounds. Podcast publishers put chapter markers and
+    cover art in this tag, and it can be enormous - the Lex Fridman feed carries
+    an 18 MB ID3 tag on some episodes. Take a naive 5 MB prefix of such a file
+    and you get a structurally valid MP3 containing no audio whatsoever.
+
+    The four size bytes are "syncsafe": each holds only 7 bits, with the high bit
+    always clear, so the tag length can never accidentally look like an MPEG
+    frame sync.
+    """
+    if len(head) < 10 or head[:3] != b"ID3":
+        return 0
+    size_bytes = head[6:10]
+    if any(b & 0x80 for b in size_bytes):
+        return 0  # not syncsafe - malformed, do not trust it
+    size = ((size_bytes[0] << 21) | (size_bytes[1] << 14)
+            | (size_bytes[2] << 7) | size_bytes[3])
+    return size + 10
+
+
+def find_frame_sync(data: bytes, limit: int = 8192) -> int:
+    """Offset of the first MPEG audio frame header, or 0 if none is found.
+
+    A frame begins with 11 set bits. Skipping to it means Transcribe receives a
+    stream that starts exactly on a frame boundary.
+    """
+    for i in range(min(len(data), limit) - 1):
+        if data[i] == 0xFF and (data[i + 1] & 0xE0) == 0xE0:
+            return i
+    return 0
 
 
 def _text(node, *paths):
