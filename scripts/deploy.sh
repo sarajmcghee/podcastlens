@@ -12,6 +12,30 @@ fi
 
 echo "==> account $ACCOUNT_ID  region $REGION  project $PROJECT"
 
+# A stack whose very first CREATE failed sits in ROLLBACK_COMPLETE. That state
+# cannot be updated - CloudFormation will only let you delete it. Clear it out
+# so a re-run after a failed first deploy just works.
+clear_failed_stack() {
+  local stack="$1" status
+  status="$(aws cloudformation describe-stacks --stack-name "$stack" --region "$REGION" \
+    --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo NONE)"
+  case "$status" in
+    ROLLBACK_COMPLETE|ROLLBACK_FAILED|REVIEW_IN_PROGRESS)
+      echo "==> $stack is in $status and cannot be updated; deleting it first"
+      aws cloudformation delete-stack --stack-name "$stack" --region "$REGION"
+      aws cloudformation wait stack-delete-complete --stack-name "$stack" --region "$REGION"
+      ;;
+    *_IN_PROGRESS)
+      echo "==> waiting for in-flight operation on $stack ($status)"
+      aws cloudformation wait stack-create-complete --stack-name "$stack" --region "$REGION" 2>/dev/null || true
+      aws cloudformation wait stack-rollback-complete --stack-name "$stack" --region "$REGION" 2>/dev/null || true
+      clear_failed_stack "$stack"
+      ;;
+  esac
+}
+
+for STACK in "$AUTH_STACK" "$CORE_STACK" "$WEB_STACK"; do clear_failed_stack "$STACK"; done
+
 # ---------------------------------------------------------------------------
 # 0. An S3 bucket to hold packaged Lambda zips. CloudFormation cannot upload
 #    local code itself - `package` puts the zip in S3 and rewrites the template
