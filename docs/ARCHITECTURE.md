@@ -153,6 +153,48 @@ The `LimitedReader` wrapper enforces the ceiling locally as well, because
 `Range` is a request the origin is free to ignore. Never let an external service
 decide how much of your budget to spend.
 
+### The ID3 trap
+
+The first real episode this project ever processed failed, with Transcribe
+reporting only *"the data in your input media file isn't valid"*. The clip was
+4.8 MB of a perfectly ordinary MP3, and `file` identified it happily as
+*"Audio file with ID3 version 2.3.0"*.
+
+The first ten bytes explain it:
+
+```
+4944 3303 0000 0853 5f2b
+I D 3  v2.3        └─ tag size, syncsafe
+```
+
+Those four size bytes are *syncsafe*: each carries only 7 bits, high bit always
+clear, so a tag length can never accidentally resemble an MPEG frame sync.
+Decoded, `(0x08<<21)|(0x53<<14)|(0x5f<<7)|0x2b` = 18,149,291 bytes, plus the
+10-byte header. **The ID3 tag on that episode is 18 MB** — chapter markers and
+cover art. Our 4.8 MB "clip" lay entirely inside the metadata and contained not
+one audio frame. Transcribe's error message was correct; it was our file that
+was wrong.
+
+So the processor now reads bytes 0–9 first, decodes the tag length, and begins
+its real range request *after* the tag, then scans forward to the first frame
+sync in case of padding between the two.
+
+Two general lessons, both worth more than the specific bug:
+
+1. **"Valid file" and "valid content" are different claims.** Every structural
+   check passed. `file` was satisfied. Only a service that tried to *use* the
+   audio noticed there wasn't any.
+2. **A byte offset derived from a container's declared length is not a byte
+   offset into its payload.** The RSS enclosure said 250 MB; 18 MB of that was
+   metadata. Subtracting the tag before deriving a bitrate is the difference
+   between a 600-second clip and a 460-second one.
+
+The same episode surfaced a third bug on retry: Transcribe job names are unique
+per account per region and **persist after a job fails**, so the obvious retry
+hits `ConflictException` forever and the episode wedges in `TRANSCRIBING`. The
+processor now inspects the existing job and deletes it if it is in a terminal
+state. Any retry path that reuses a natural key needs this consideration.
+
 ---
 
 ## What is deliberately missing
