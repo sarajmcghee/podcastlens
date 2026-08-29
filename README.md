@@ -157,6 +157,8 @@ stub out boto3, so they run offline with no credentials and no charges.
 
 ## Study material
 
+- [docs/CONSOLE-TOUR.md](docs/CONSOLE-TOUR.md) — where every piece of this shows
+  up in the AWS Console, and why EC2 is empty
 - [docs/EXAM-MAP.md](docs/EXAM-MAP.md) — every service here mapped to the SAA-C03
   exam domains, with the specific question patterns each one shows up in
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — why each design decision went
