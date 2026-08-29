@@ -1,0 +1,488 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  PodcastLens - data, compute and the ingestion pipeline.
+
+  Read this file top to bottom and you have read the architecture. Every
+  resource carries a comment explaining what it does and, more usefully, why it
+  is shaped the way it is.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: podcastlens
+  NotificationEmail:
+    Type: String
+    Description: Where episode-ready alerts, alarms and budget warnings are sent.
+  PollRateMinutes:
+    Type: Number
+    Default: 360
+    Description: How often to check feeds for new episodes. 360 = every 6 hours.
+  ClipSeconds:
+    Type: Number
+    Default: 600
+    Description: >
+      Seconds of each episode to transcribe. 600 = 10 minutes, which fits six
+      episodes inside the 60-minute monthly Transcribe free tier. Set 0 for the
+      whole episode and watch the bill.
+  MonthlyTranscribeSeconds:
+    Type: Number
+    Default: 3000
+    Description: Hard monthly ceiling on transcribed audio. 3000s = 50 minutes.
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 5
+    Description: AWS Budgets alerts you by email before you cross this.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    # Graviton. Same code, ~20% cheaper per GB-second than x86, and the free
+    # tier's 400,000 GB-seconds therefore stretch further.
+    Architectures: [arm64]
+    Timeout: 30
+    MemorySize: 512
+    # X-Ray traces every invocation end to end. The first 100,000 traces a
+    # month are free, and this is how you answer "why was that request slow".
+    Tracing: Active
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref Table
+        MEDIA_BUCKET: !Ref MediaBucket
+        TOPIC_ARN: !Ref Topic
+        CLIP_SECONDS: !Ref ClipSeconds
+        MONTHLY_TRANSCRIBE_SECONDS: !Ref MonthlyTranscribeSeconds
+        POWERTOOLS_LOG_LEVEL: INFO
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # Storage
+  # ---------------------------------------------------------------------------
+
+  Table:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}"
+      # On-demand: you pay per request and nothing at idle. Provisioned capacity
+      # is cheaper at steady high volume, but this workload is bursty and mostly
+      # asleep, which is exactly the case on-demand exists for.
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: PK, AttributeType: S}
+        - {AttributeName: SK, AttributeType: S}
+        - {AttributeName: GSI1PK, AttributeType: S}
+        - {AttributeName: GSI1SK, AttributeType: S}
+      KeySchema:
+        - {AttributeName: PK, KeyType: HASH}
+        - {AttributeName: SK, KeyType: RANGE}
+      GlobalSecondaryIndexes:
+        # Lets us ask "which episodes are stuck in TRANSCRIBING?" without
+        # scanning the table. A GSI is a separate copy of the data with a
+        # different key - that is why it costs its own write capacity.
+        - IndexName: GSI1
+          KeySchema:
+            - {AttributeName: GSI1PK, KeyType: HASH}
+            - {AttributeName: GSI1SK, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        # Encryption at rest with an AWS-owned key: on by default, no charge.
+        # Switch to KMS with a customer-managed key when you need your own key
+        # policy and rotation - that costs $1/month per key.
+        SSEEnabled: true
+
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # Bucket names are globally unique across every AWS account on earth.
+      BucketName: !Sub "${ProjectName}-media-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced   # ACLs disabled entirely
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+            BucketKeyEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          # The completer deletes each clip as soon as it is transcribed. This
+          # rule is the safety net for anything that failed halfway through -
+          # without it, orphaned audio accumulates forever and you pay for it.
+          - Id: expire-audio-clips
+            Status: Enabled
+            Prefix: audio/
+            ExpirationInDays: 3
+          # A failed multipart upload leaves paid-for parts behind that you
+          # cannot see in the console. Everyone forgets this rule once.
+          - Id: abort-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload: {DaysAfterInitiation: 1}
+
+  MediaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MediaBucket
+      PolicyDocument:
+        Statement:
+          # Refuse any request that did not arrive over TLS. Blocking public
+          # access stops the wrong people reading the bucket; this stops the
+          # right people reading it over plaintext HTTP.
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt MediaBucket.Arn
+              - !Sub "${MediaBucket.Arn}/*"
+            Condition:
+              Bool: {"aws:SecureTransport": false}
+
+  # ---------------------------------------------------------------------------
+  # Messaging
+  # ---------------------------------------------------------------------------
+
+  EpisodeQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-episodes"
+      # Must be at least the consumer's timeout, or SQS will hand the same
+      # message to a second Lambda while the first is still working on it.
+      VisibilityTimeout: 960
+      MessageRetentionPeriod: 1209600   # 14 days, the maximum
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt EpisodeDlq.Arn
+        # Three strikes. A message that fails four times is not going to
+        # succeed on the fifth - park it somewhere you can inspect it.
+        maxReceiveCount: 3
+
+  EpisodeDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-episodes-dlq"
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  Topic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-notifications"
+      DisplayName: PodcastLens
+
+  TopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref Topic
+      Protocol: email
+      # AWS emails you a confirmation link. Until you click it the subscription
+      # sits in PendingConfirmation and you receive nothing.
+      Endpoint: !Ref NotificationEmail
+
+  # ---------------------------------------------------------------------------
+  # API
+  # ---------------------------------------------------------------------------
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: v1
+      Auth:
+        DefaultAuthorizer: CognitoJwt
+        Authorizers:
+          # API Gateway validates the JWT's signature, issuer, audience and
+          # expiry before your Lambda is ever invoked. Unauthenticated requests
+          # are rejected at the edge and you are not billed for them.
+          CognitoJwt:
+            IdentitySource: "$request.header.Authorization"
+            JwtConfiguration:
+              issuer: {"Fn::ImportValue": !Sub "${ProjectName}-UserPoolIssuer"}
+              audience:
+                - {"Fn::ImportValue": !Sub "${ProjectName}-UserPoolClientId"}
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowHeaders: [content-type, authorization]
+        AllowMethods: [GET, POST, DELETE, OPTIONS]
+        MaxAge: 600
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogs.Arn
+        Format: '{"time":"$context.requestTime","method":"$context.httpMethod","path":"$context.path","status":"$context.status","latency":"$context.responseLatency","error":"$context.error.message"}'
+
+  ApiAccessLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${ProjectName}"
+      # Logs are billed for storage forever unless you say otherwise. This is
+      # the most commonly forgotten line item in a hobby AWS account.
+      RetentionInDays: 14
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-api"
+      CodeUri: ../src
+      Handler: api.handler.lambda_handler
+      Description: Serves every HTTP route behind the Cognito authorizer.
+      Policies:
+        # SAM policy templates expand into scoped IAM statements - this one
+        # grants CRUD on exactly this table and its indexes, not on DynamoDB
+        # generally. Read the expanded policy in the console; it is instructive.
+        - DynamoDBCrudPolicy: {TableName: !Ref Table}
+        - S3ReadPolicy: {BucketName: !Ref MediaBucket}
+      Events:
+        ListFeeds:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: "/feeds"
+        AddFeed:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: POST
+            Path: "/feeds"
+        DeleteFeed:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: DELETE
+            Path: "/feeds/{feedId}"
+        ListEpisodes:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: "/feeds/{feedId}/episodes"
+        Search:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: "/search"
+        Budget:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: "/budget"
+
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-api"
+      RetentionInDays: 14
+
+  # ---------------------------------------------------------------------------
+  # Ingestion pipeline
+  # ---------------------------------------------------------------------------
+
+  PollerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-poller"
+      CodeUri: ../src
+      Handler: pipeline.poller.lambda_handler
+      Description: Scheduled. Finds new episodes and fans them out to SQS.
+      Timeout: 120
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref EpisodeQueue
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref Table}
+        - SQSSendMessagePolicy: {QueueName: !GetAtt EpisodeQueue.QueueName}
+      Events:
+        Timer:
+          Type: Schedule
+          Properties:
+            Schedule: !Sub "rate(${PollRateMinutes} minutes)"
+            Description: Poll subscribed podcast feeds for new episodes.
+
+  PollerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-poller"
+      RetentionInDays: 14
+
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-processor"
+      CodeUri: ../src
+      Handler: pipeline.processor.lambda_handler
+      Description: Consumes SQS. Copies an audio clip to S3 and starts Transcribe.
+      # The long pole: downloading tens of megabytes from a podcast CDN.
+      Timeout: 900
+      # More memory also means more CPU and more network throughput on Lambda,
+      # so a bigger function can finish a download in less wall-clock time and
+      # sometimes costs less overall. Worth benchmarking rather than guessing.
+      MemorySize: 1024
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref Table}
+        - S3CrudPolicy: {BucketName: !Ref MediaBucket}
+        - Statement:
+            - Effect: Allow
+              Action: [transcribe:StartTranscriptionJob, transcribe:GetTranscriptionJob]
+              # Scoped to job names this project creates, not every job in the
+              # account. Least privilege is a habit, not a checkbox.
+              Resource: !Sub "arn:${AWS::Partition}:transcribe:${AWS::Region}:${AWS::AccountId}:transcription-job/pl-*"
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt EpisodeQueue.Arn
+            BatchSize: 1
+            # Tell Lambda which individual messages failed so the rest of the
+            # batch is acknowledged rather than redelivered.
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  ProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-processor"
+      RetentionInDays: 14
+
+  CompleterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-completer"
+      CodeUri: ../src
+      Handler: pipeline.completer.lambda_handler
+      Description: Reacts to Transcribe finishing. Extracts topics, builds the index.
+      Timeout: 300
+      MemorySize: 1024
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref Table}
+        - S3CrudPolicy: {BucketName: !Ref MediaBucket}
+        - SNSPublishMessagePolicy: {TopicName: !GetAtt Topic.TopicName}
+        - Statement:
+            - Effect: Allow
+              # Comprehend's detect APIs are stateless and have no resource to
+              # scope to, so "*" here is the tightest policy the service allows.
+              Action: [comprehend:BatchDetectKeyPhrases, comprehend:BatchDetectEntities]
+              Resource: "*"
+      Events:
+        TranscribeFinished:
+          Type: EventBridgeRule
+          Properties:
+            # Nothing polls. Transcribe publishes a state-change event to the
+            # default event bus and this pattern picks ours out of it.
+            Pattern:
+              source: [aws.transcribe]
+              detail-type: ["Transcribe Job State Change"]
+              detail:
+                TranscriptionJobStatus: [COMPLETED, FAILED]
+
+  CompleterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-completer"
+      RetentionInDays: 14
+
+  DigestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-digest"
+      CodeUri: ../src
+      Handler: digest.weekly.lambda_handler
+      Description: Weekly summary email of everything transcribed.
+      Timeout: 60
+      Policies:
+        - DynamoDBReadPolicy: {TableName: !Ref Table}
+        - SNSPublishMessagePolicy: {TopicName: !GetAtt Topic.TopicName}
+      Events:
+        Weekly:
+          Type: Schedule
+          Properties:
+            Schedule: "cron(0 9 ? * MON *)"   # Mondays 09:00 UTC
+            Description: Send the PodcastLens weekly digest.
+
+  DigestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-digest"
+      RetentionInDays: 14
+
+  # ---------------------------------------------------------------------------
+  # Observability and cost control
+  # ---------------------------------------------------------------------------
+
+  DlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-dlq-not-empty"
+      AlarmDescription: An episode failed three times and landed in the DLQ.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - {Name: QueueName, Value: !GetAtt EpisodeDlq.QueueName}
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref Topic]
+
+  ProcessorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-processor-errors"
+      AlarmDescription: The download/transcribe step is throwing.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref ProcessorFunction}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 2
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref Topic]
+
+  Budget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub "${ProjectName}-monthly"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: {Amount: !Ref MonthlyBudgetUsd, Unit: USD}
+      NotificationsWithSubscribers:
+        # Actual spend crossing 50% of a $5 budget means $2.50 - early enough
+        # to investigate before it matters.
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 50
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - {SubscriptionType: EMAIL, Address: !Ref NotificationEmail}
+        # FORECASTED catches a runaway before the money is actually gone.
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - {SubscriptionType: EMAIL, Address: !Ref NotificationEmail}
+
+Outputs:
+  ApiUrl:
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/v1"
+    Export: {Name: !Sub "${ProjectName}-ApiUrl"}
+  TableName:
+    Value: !Ref Table
+  MediaBucketName:
+    Value: !Ref MediaBucket
+  QueueUrl:
+    Value: !Ref EpisodeQueue
+  TopicArn:
+    Value: !Ref Topic

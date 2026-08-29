@@ -1,0 +1,107 @@
+:root {
+  --bg: #f7f7f5;
+  --surface: #ffffff;
+  --border: #e3e2dd;
+  --text: #1f1e1b;
+  --muted: #6f6d66;
+  --accent: #b4530a;
+  --accent-soft: #fdf1e6;
+  --ok: #16794a;
+  --warn: #9a6700;
+  --err: #b3261e;
+  --radius: 10px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #171614;
+    --surface: #201f1c;
+    --border: #34322d;
+    --text: #ece9e3;
+    --muted: #9a968d;
+    --accent: #e08c48;
+    --accent-soft: #2c231a;
+    --ok: #5fcf9a;
+    --warn: #e0b44b;
+    --err: #f08279;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.55 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+.bar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 1rem; padding: .85rem 1.25rem;
+  background: var(--surface); border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 10;
+}
+.brand { font-weight: 650; letter-spacing: -.01em; }
+.bar-right { display: flex; align-items: center; gap: .75rem; }
+.budget { font-size: .8rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+main { max-width: 860px; margin: 0 auto; padding: 1.5rem 1.25rem 4rem; }
+.panel {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 1.1rem 1.25rem; margin-bottom: 1.25rem;
+}
+h2 { font-size: .95rem; margin: 0 0 .85rem; letter-spacing: .01em; }
+.row { display: flex; gap: .5rem; flex-wrap: wrap; }
+input {
+  flex: 1 1 16rem; min-width: 0;
+  padding: .55rem .7rem; border: 1px solid var(--border);
+  border-radius: 8px; background: var(--bg); color: var(--text); font: inherit;
+}
+input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.btn {
+  padding: .55rem .95rem; border: 1px solid transparent; border-radius: 8px;
+  background: var(--accent); color: #fff; font: inherit; font-weight: 550;
+  cursor: pointer; white-space: nowrap;
+}
+.btn.ghost { background: transparent; color: var(--text); border-color: var(--border); }
+.btn:hover { filter: brightness(1.06); }
+.muted { color: var(--muted); }
+.feeds { display: grid; gap: .5rem; margin-top: .9rem; }
+.feed {
+  display: flex; align-items: center; gap: .75rem; width: 100%;
+  padding: .6rem .7rem; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg); color: inherit; font: inherit; text-align: left; cursor: pointer;
+}
+.feed[aria-current="true"] { border-color: var(--accent); background: var(--accent-soft); }
+.feed img { width: 40px; height: 40px; border-radius: 6px; object-fit: cover; flex: none; }
+.feed-meta { flex: 1; min-width: 0; }
+.feed-title { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.feed-sub { font-size: .78rem; color: var(--muted); }
+.link-btn {
+  border: 0; background: none; color: var(--muted); cursor: pointer;
+  font: inherit; font-size: .8rem; padding: .2rem .4rem;
+}
+.link-btn:hover { color: var(--err); }
+.episodes { display: grid; gap: .6rem; }
+.episode { padding: .7rem .8rem; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); }
+.episode h3 { margin: 0 0 .3rem; font-size: .9rem; font-weight: 600; }
+.tags { display: flex; flex-wrap: wrap; gap: .3rem; margin-top: .5rem; }
+.tag {
+  font-size: .72rem; padding: .15rem .45rem; border-radius: 99px;
+  background: var(--accent-soft); color: var(--accent); border: 1px solid var(--border);
+}
+.badge {
+  font-size: .68rem; font-weight: 600; letter-spacing: .04em; text-transform: uppercase;
+  padding: .12rem .4rem; border-radius: 4px; border: 1px solid currentColor;
+}
+.badge.READY { color: var(--ok); }
+.badge.TRANSCRIBING, .badge.DOWNLOADING, .badge.NEW { color: var(--warn); }
+.badge.FAILED, .badge.TOO_LARGE, .badge.BUDGET_SKIPPED { color: var(--err); }
+.results { display: grid; gap: .6rem; margin-top: .9rem; }
+.result { padding: .7rem .8rem; border-left: 3px solid var(--accent); background: var(--bg); border-radius: 0 8px 8px 0; }
+.result h3 { margin: 0 0 .3rem; font-size: .88rem; }
+.result p { margin: 0; font-size: .85rem; color: var(--muted); }
+.empty { max-width: 34rem; margin: 18vh auto; padding: 0 1.25rem; text-align: center; }
+.empty h1 { font-size: 1.6rem; margin-bottom: .5rem; }
+.empty p { color: var(--muted); margin-bottom: 1.5rem; }
+.toast {
+  position: fixed; bottom: 1.25rem; left: 50%; transform: translateX(-50%);
+  background: var(--text); color: var(--bg); padding: .6rem 1rem;
+  border-radius: 8px; font-size: .85rem; max-width: 90vw; z-index: 50;
+}
