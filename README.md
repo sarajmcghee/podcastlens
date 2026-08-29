@@ -140,6 +140,7 @@ docs/                    Architecture notes, exam mapping, cost breakdown
 |---|---|
 | `./scripts/deploy.sh` | Deploy or update everything. Safe to re-run. |
 | `./scripts/create-user.sh EMAIL` | Create a Cognito login |
+| `./scripts/seed-feed.sh URL EMAIL` | Add a feed without opening the browser |
 | `./scripts/poll-now.sh` | Trigger the poller immediately |
 | `./scripts/status.sh` | Pipeline health: episode states, budget, DLQ depth |
 | `./scripts/logs.sh processor` | Tail one Lambda's logs |
