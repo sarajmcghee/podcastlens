@@ -1,0 +1,17 @@
+# Generated at deploy time — contains your account's API URL and client id
+web/config.js
+
+# CloudFormation packaging intermediates
+.packaged-*.yaml
+
+# Local env overrides
+.env
+*.local.sh
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store

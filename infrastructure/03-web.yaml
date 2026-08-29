@@ -1,0 +1,113 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  PodcastLens - the public front door. A private S3 bucket serving a static site
+  through CloudFront.
+
+  The pattern to remember: the bucket is never public. CloudFront authenticates
+  to S3 with Origin Access Control, so the only route to your objects is through
+  the CDN, where you get TLS, caching, and security headers for free.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: podcastlens
+
+Resources:
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-site-${AWS::AccountId}-${AWS::Region}"
+      # Note what is NOT here: no WebsiteConfiguration. S3 static website
+      # hosting requires a public bucket and only speaks HTTP. This bucket stays
+      # locked down and CloudFront does the serving.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-oac"
+        OriginAccessControlOriginType: s3
+        # CloudFront signs each origin request with SigV4. This replaced the
+        # older Origin Access Identity; OAC is the current answer on the exam.
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${ProjectName} static site"
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        # PriceClass_100 uses only North America and Europe edge locations.
+        # Fewer edges, lower price. PriceClass_All is the global default.
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: s3-site
+            # Must be the REGIONAL domain name. The legacy global one breaks
+            # SigV4 signing with OAC.
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: s3-site
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # AWS managed policy "CachingOptimized". Using a managed policy id
+          # instead of hand-rolling one is the current best practice.
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          # AWS managed "SecurityHeadersPolicy" - adds HSTS, X-Content-Type-
+          # Options, Referrer-Policy and friends without touching your HTML.
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03
+        CustomErrorResponses:
+          # A single-page app owns its own routing, so a deep link that S3 has
+          # never heard of must still return index.html rather than an error.
+          - {ErrorCode: 403, ResponseCode: 200, ResponsePagePath: /index.html, ErrorCachingMinTTL: 10}
+          - {ErrorCode: 404, ResponseCode: 200, ResponsePagePath: /index.html, ErrorCachingMinTTL: 10}
+        ViewerCertificate:
+          # The free *.cloudfront.net certificate. Bringing your own domain
+          # means an ACM certificate issued in us-east-1 - CloudFront is a
+          # global service and only reads certs from that region.
+          CloudFrontDefaultCertificate: true
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontOnly
+            Effect: Allow
+            # The principal is the CloudFront service, not an IAM user...
+            Principal: {Service: cloudfront.amazonaws.com}
+            Action: s3:GetObject
+            Resource: !Sub "${SiteBucket.Arn}/*"
+            Condition:
+              # ...and the condition pins it to THIS distribution, so nobody
+              # else's CloudFront distribution can read your bucket.
+              StringEquals:
+                "AWS:SourceArn": !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+Outputs:
+  SiteBucketName:
+    Value: !Ref SiteBucket
+  DistributionId:
+    Value: !Ref Distribution
+  SiteUrl:
+    Value: !Sub "https://${Distribution.DomainName}"
+    Export: {Name: !Sub "${ProjectName}-SiteUrl"}

@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PodcastLens</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🎙️</text></svg>">
+</head>
+<body>
+  <header class="bar">
+    <div class="brand"><span aria-hidden="true">🎙️</span> PodcastLens</div>
+    <div class="bar-right">
+      <span id="budget" class="budget" hidden></span>
+      <button id="auth-btn" class="btn ghost">Sign in</button>
+    </div>
+  </header>
+
+  <main id="app" hidden>
+    <section class="panel">
+      <h2>Search transcripts</h2>
+      <form id="search-form" class="row">
+        <input id="search-input" type="search" placeholder="e.g. consciousness, neural networks, free will" minlength="3" required>
+        <button class="btn" type="submit">Search</button>
+      </form>
+      <div id="search-results" class="results"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Feeds</h2>
+      <form id="feed-form" class="row">
+        <input id="feed-input" type="url" placeholder="https://lexfridman.com/feed/podcast/" required>
+        <button class="btn" type="submit">Add feed</button>
+      </form>
+      <div id="feeds" class="feeds"></div>
+    </section>
+
+    <section class="panel">
+      <h2 id="episodes-title">Episodes</h2>
+      <div id="episodes" class="episodes"><p class="muted">Pick a feed above.</p></div>
+    </section>
+  </main>
+
+  <div id="signed-out" class="empty">
+    <h1>PodcastLens</h1>
+    <p>Transcribes your podcasts, pulls out the topics, and makes the whole thing searchable.</p>
+    <button id="signin-cta" class="btn">Sign in to continue</button>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

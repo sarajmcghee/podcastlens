@@ -1,0 +1,100 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  PodcastLens - identity. A Cognito User Pool plus its hosted sign-in UI.
+
+  This is its own stack because identity outlives everything else. You will
+  redeploy the API a hundred times; deleting the stack that holds your users
+  is a different kind of event, so it gets its own blast radius.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: podcastlens
+  CallbackUrl:
+    Type: String
+    Default: http://localhost:5173/
+    Description: >
+      Where Cognito redirects after sign-in. Starts as localhost because the
+      CloudFront domain does not exist yet - deploy.sh comes back and updates
+      this once stack 03 has created the distribution.
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${ProjectName}-users"
+      # Sign in with an email address rather than a separate username.
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      # Cognito's own email sender is free but rate limited to ~50/day. That is
+      # plenty for one person; a real product would wire this to SES.
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      # Only you can create accounts. Without this, your sign-in page is an
+      # open registration form on the public internet.
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      DeletionProtection: ACTIVE
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${ProjectName}-web"
+      UserPoolId: !Ref UserPool
+      # No client secret: a browser cannot keep one. Security comes from the
+      # authorization-code flow with PKCE instead, which is what the web app uses.
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs:
+        - !Ref CallbackUrl
+        - http://localhost:5173/
+      LogoutURLs:
+        - !Ref CallbackUrl
+        - http://localhost:5173/
+      AccessTokenValidity: 8
+      IdTokenValidity: 8
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      ExplicitAuthFlows:
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      # Domain prefixes are globally unique across all AWS accounts, so the
+      # account id keeps it from colliding with someone else's.
+      Domain: !Sub "${ProjectName}-${AWS::AccountId}"
+      UserPoolId: !Ref UserPool
+
+Outputs:
+  UserPoolId:
+    Value: !Ref UserPool
+    Export: {Name: !Sub "${ProjectName}-UserPoolId"}
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+    Export: {Name: !Sub "${ProjectName}-UserPoolClientId"}
+  UserPoolIssuer:
+    Value: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+    Export: {Name: !Sub "${ProjectName}-UserPoolIssuer"}
+  HostedUiDomain:
+    Value: !Sub "https://${ProjectName}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com"
+    Export: {Name: !Sub "${ProjectName}-HostedUiDomain"}
