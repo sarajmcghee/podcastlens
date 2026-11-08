@@ -5,50 +5,51 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>PodcastLens</title>
   <link rel="stylesheet" href="styles.css">
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🎙️</text></svg>">
 </head>
 <body>
   <header class="bar">
     <div class="brand"><span aria-hidden="true">🎙️</span> PodcastLens</div>
     <div class="bar-right">
       <span id="budget" class="budget" hidden></span>
-      <button id="auth-btn" class="btn ghost">Sign in</button>
+      <button id="auth-btn" class="btn ghost" hidden>Sign out</button>
     </div>
   </header>
-
   <main id="app" hidden>
     <section class="panel">
-      <h2>Search transcripts</h2>
+      <div class="row section-heading"><h2>Recordings</h2><button id="refresh-btn" class="btn ghost">Refresh</button></div>
+      <p id="refresh-note" class="muted">Processing status refreshes every 15 seconds while this page is open.</p>
+      <div id="episodes" class="episodes" aria-live="polite"></div>
+      <button id="more-btn" class="btn ghost" hidden>Load more recordings</button>
+    </section>
+    <section id="transcript-panel" class="panel" hidden>
+      <h2 id="transcript-title">Transcript</h2>
       <form id="search-form" class="row">
-        <input id="search-input" type="search" placeholder="e.g. consciousness, neural networks, free will" minlength="3" required>
+        <input id="search-input" type="search" aria-label="Search this transcript" placeholder="Find a word in this transcript" maxlength="200" required>
         <button class="btn" type="submit">Search</button>
       </form>
-      <div id="search-results" class="results"></div>
+      <div id="search-results" class="results" aria-live="polite"></div>
+      <p id="transcript-text" class="transcript"></p>
     </section>
-
     <section class="panel">
-      <h2>Feeds</h2>
-      <form id="feed-form" class="row">
-        <input id="feed-input" type="url" placeholder="https://lexfridman.com/feed/podcast/" required>
-        <button class="btn" type="submit">Add feed</button>
+      <div class="row section-heading"><h2>Podcast feeds</h2><button id="scan-btn" class="btn ghost">Check feeds now</button></div>
+      <form id="feed-form">
+        <label for="feed-input">RSS feed URL</label>
+        <input id="feed-input" type="url" placeholder="https://example.com/podcast.xml" required>
+        <label for="hosts-input">Allowed audio and redirect hosts</label>
+        <input id="hosts-input" type="text" placeholder="audio.example.com, cdn.example.com" maxlength="4096">
+        <p class="muted">The feed host is included automatically. Add exact hostnames for audio downloads and redirects. Up to five feeds.</p>
+        <button class="btn" type="submit">Save feed</button>
       </form>
       <div id="feeds" class="feeds"></div>
     </section>
-
-    <section class="panel">
-      <h2 id="episodes-title">Episodes</h2>
-      <div id="episodes" class="episodes"><p class="muted">Pick a feed above.</p></div>
-    </section>
   </main>
-
   <div id="signed-out" class="empty">
     <h1>PodcastLens</h1>
-    <p>Transcribes your podcasts, pulls out the topics, and makes the whole thing searchable.</p>
+    <p>Your recordings, transcripts and podcast feeds in one place.</p>
     <button id="signin-cta" class="btn">Sign in to continue</button>
+    <p id="config-error" role="alert" hidden></p>
   </div>
-
-  <div id="toast" class="toast" hidden></div>
-
+  <div id="toast" class="toast" role="status" hidden></div>
   <script src="config.js"></script>
   <script src="app.js"></script>
 </body>

@@ -1,274 +1,207 @@
-/* PodcastLens front end.
- *
- * No framework and no build step: the whole app is one file served as static
- * objects from S3 through CloudFront. Sign-in uses the OAuth 2.0 authorization
- * code flow with PKCE against Cognito's hosted UI, which is the correct pattern
- * for a browser app that cannot keep a client secret.
- */
-
+/* PodcastLens operator dashboard: Cognito code + PKCE, existing pipeline data. */
 const CFG = window.PODCASTLENS_CONFIG;
-const TOKEN_KEY = "pl.idToken";
+const TOKEN_KEY = "pl.accessToken";
 const VERIFIER_KEY = "pl.verifier";
-
-/* ---------------------------------------------------------------- PKCE ---- */
-
-function randomString(bytes = 48) {
-  const buf = crypto.getRandomValues(new Uint8Array(bytes));
-  return base64url(buf);
-}
+const STATE_KEY = "pl.state";
+const $ = id => document.getElementById(id);
+const token = () => sessionStorage.getItem(TOKEN_KEY);
+let nextCursor = null;
+let recordings = [];
+let selectedEpisode = null;
+let refreshing = false;
+let paginationExpanded = false;
+let session = 0;
 
 function base64url(bytes) {
-  return btoa(String.fromCharCode(...new Uint8Array(bytes)))
-    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
-
-async function challengeFor(verifier) {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
-  return base64url(digest);
-}
-
+function randomString() { return base64url(crypto.getRandomValues(new Uint8Array(48))); }
 async function signIn() {
-  // The verifier stays in this browser tab. Only its SHA-256 hash travels to
-  // Cognito, so intercepting the redirect does not let an attacker redeem the
-  // authorization code.
-  const verifier = randomString();
+  const verifier = randomString(), state = randomString();
   sessionStorage.setItem(VERIFIER_KEY, verifier);
+  sessionStorage.setItem(STATE_KEY, state);
+  const challenge = base64url(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)));
   const params = new URLSearchParams({
-    response_type: "code",
-    client_id: CFG.clientId,
-    redirect_uri: CFG.redirectUri,
-    scope: "openid email profile",
-    code_challenge: await challengeFor(verifier),
-    code_challenge_method: "S256",
+    response_type: "code", client_id: CFG.clientId, redirect_uri: CFG.redirectUri,
+    scope: "openid email profile podcastlens/access", state,
+    code_challenge: challenge, code_challenge_method: "S256",
   });
   location.assign(`${CFG.hostedUi}/oauth2/authorize?${params}`);
 }
-
-function signOut() {
+function clearSession() {
+  session += 1;
   sessionStorage.removeItem(TOKEN_KEY);
-  const params = new URLSearchParams({
-    client_id: CFG.clientId,
-    logout_uri: CFG.redirectUri,
-  });
+  recordings = []; selectedEpisode = null; nextCursor = null;
+  $("episodes").replaceChildren();
+  $("transcript-text").textContent = "";
+  $("search-results").replaceChildren();
+  $("feeds").replaceChildren();
+  $("transcript-panel").hidden = true;
+  $("app").hidden = true; $("signed-out").hidden = false;
+  $("auth-btn").hidden = true; $("budget").hidden = true;
+}
+function signOut() {
+  clearSession();
+  const params = new URLSearchParams({client_id: CFG.clientId, logout_uri: CFG.redirectUri});
   location.assign(`${CFG.hostedUi}/logout?${params}`);
 }
-
-async function exchangeCode(code) {
+async function exchangeCode(code, state) {
   const verifier = sessionStorage.getItem(VERIFIER_KEY);
-  if (!verifier) throw new Error("missing PKCE verifier - start sign-in again");
-
-  const resp = await fetch(`${CFG.hostedUi}/oauth2/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "authorization_code",
-      client_id: CFG.clientId,
-      code,
-      redirect_uri: CFG.redirectUri,
-      code_verifier: verifier,
-    }),
-  });
-  if (!resp.ok) throw new Error(`token exchange failed: ${await resp.text()}`);
-
-  const tokens = await resp.json();
+  const expected = sessionStorage.getItem(STATE_KEY);
+  sessionStorage.removeItem(STATE_KEY);
   sessionStorage.removeItem(VERIFIER_KEY);
-  // The ID token, not the access token: API Gateway's JWT authorizer checks the
-  // `aud` claim against our client id, and only the ID token carries one.
-  sessionStorage.setItem(TOKEN_KEY, tokens.id_token);
-}
-
-const token = () => sessionStorage.getItem(TOKEN_KEY);
-
-/* ------------------------------------------------------------------ API --- */
-
-async function api(path, options = {}) {
-  const resp = await fetch(`${CFG.apiUrl}${path}`, {
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: token(),
-      ...(options.headers || {}),
-    },
+  if (!verifier || !expected || state !== expected) throw new Error("Sign-in could not be verified. Please start again.");
+  const resp = await fetch(`${CFG.hostedUi}/oauth2/token`, {
+    method: "POST", headers: {"Content-Type": "application/x-www-form-urlencoded"},
+    body: new URLSearchParams({grant_type: "authorization_code", client_id: CFG.clientId,
+      code, redirect_uri: CFG.redirectUri, code_verifier: verifier}),
   });
-  if (resp.status === 401) {
-    sessionStorage.removeItem(TOKEN_KEY);
-    render();
-    throw new Error("session expired - sign in again");
-  }
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(data.error || `request failed (${resp.status})`);
-  return data;
+  if (!resp.ok) throw new Error("Sign-in failed. Please try again.");
+  const result = await resp.json();
+  if (!result.access_token) throw new Error("Sign-in did not return an access token.");
+  sessionStorage.setItem(TOKEN_KEY, result.access_token);
 }
-
-/* ------------------------------------------------------------------- UI --- */
-
-const $ = (id) => document.getElementById(id);
-let activeFeedId = null;
-
-function toast(message, ms = 4000) {
-  const el = $("toast");
-  el.textContent = message;
-  el.hidden = false;
-  clearTimeout(toast._t);
-  toast._t = setTimeout(() => { el.hidden = true; }, ms);
+function toast(message) {
+  $("toast").textContent = message; $("toast").hidden = false;
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => { $("toast").hidden = true; }, 6000);
 }
-
-function esc(s) {
-  return String(s ?? "").replace(/[&<>"']/g, (c) =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 }
-
-function render() {
-  const signedIn = Boolean(token());
-  $("app").hidden = !signedIn;
-  $("signed-out").hidden = signedIn;
-  $("auth-btn").textContent = signedIn ? "Sign out" : "Sign in";
-  $("auth-btn").hidden = !signedIn;
-  if (signedIn) { loadFeeds(); loadBudget(); }
+async function api(path, options = {}) {
+  const current = session;
+  const resp = await fetch(CFG.apiUrl + path, {...options, headers: {
+    "Content-Type": "application/json", Authorization: `Bearer ${token()}`,
+  }});
+  if (current !== session) throw new Error("Session changed.");
+  if (resp.status === 401) { clearSession(); throw new Error("Your session expired. Sign in again."); }
+  const result = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(result.error || `Request failed (${resp.status}).`);
+  return result;
 }
-
+function duration(seconds) {
+  const value = Math.max(0, Number(seconds));
+  return `${Math.floor(value / 60)}m ${value % 60}s`;
+}
 async function loadBudget() {
   try {
     const b = await api("/budget");
-    const used = Math.round(b.usedSeconds / 60);
-    const cap = Math.round(b.capSeconds / 60);
-    const el = $("budget");
-    el.textContent = `Transcribe: ${used}/${cap} min this month`;
-    el.hidden = false;
-  } catch { /* a missing budget readout is not worth interrupting anyone over */ }
+    $("budget").textContent = `${duration(b.usedSeconds)} / ${duration(b.capSeconds)} reserved this month`;
+    $("budget").hidden = false;
+  } catch (error) { $("budget").textContent = "Budget unavailable"; $("budget").hidden = false; }
 }
-
+function renderRecordings() {
+  $("episodes").innerHTML = recordings.length ? recordings.map(e => `
+    <article class="episode">
+      <h3>${esc(e.title || "Untitled recording")}</h3>
+      <span class="badge ${esc(e.status)}">${esc(e.status.replaceAll("_", " "))}</span>
+      <p class="muted">${esc(e.source || "")} · ${esc(new Date(e.updatedAt).toLocaleString())}</p>
+      ${e.errorCode ? `<p class="muted">${esc(e.errorCode)}</p>` : ""}
+      ${e.status === "COMPLETED" ? `<button class="btn ghost open-transcript" data-id="${esc(e.episodeId)}">Read transcript</button>` : ""}
+    </article>`).join("") : '<p class="muted">No recordings on this page yet. Check your feeds or load the next page.</p>';
+  $("episodes").querySelectorAll(".open-transcript").forEach(button => {
+    button.onclick = () => openTranscript(button.dataset.id);
+  });
+  $("more-btn").hidden = !nextCursor;
+}
+async function loadRecordings(more = false) {
+  const data = await api("/episodes" + (more && nextCursor ? `?cursor=${encodeURIComponent(nextCursor)}` : ""));
+  const byId = new Map((more ? recordings : []).map(e => [e.episodeId, e]));
+  data.episodes.forEach(e => byId.set(e.episodeId, e));
+  recordings = [...byId.values()].sort((a,b) => b.updatedAt.localeCompare(a.updatedAt));
+  nextCursor = data.nextCursor;
+  paginationExpanded = more;
+  $("refresh-note").textContent = more ? "Automatic refresh is paused while browsing older recordings. Select Refresh to return to the first page."
+    : "Processing status refreshes every 15 seconds while this page is open.";
+  renderRecordings();
+}
+async function openTranscript(id) {
+  selectedEpisode = id;
+  $("transcript-panel").hidden = false;
+  $("transcript-title").textContent = "Loading transcript…";
+  $("transcript-text").textContent = "";
+  $("search-results").replaceChildren();
+  try {
+    const data = await api(`/episodes/${encodeURIComponent(id)}/transcript`);
+    if (selectedEpisode !== id) return;
+    $("transcript-title").textContent = data.episode.title;
+    $("transcript-text").textContent = data.text;
+    $("transcript-panel").scrollIntoView({behavior: "smooth", block: "start"});
+  } catch (error) { $("transcript-title").textContent = "Transcript"; toast(error.message); }
+}
 async function loadFeeds() {
-  const box = $("feeds");
-  try {
-    const { feeds } = await api("/feeds");
-    if (!feeds.length) {
-      box.innerHTML = `<p class="muted">No feeds yet. Add one above to get started.</p>`;
-      return;
-    }
-    box.innerHTML = "";
-    for (const f of feeds) {
-      const row = document.createElement("div");
-      row.className = "row";
-      row.style.gap = ".25rem";
-      row.innerHTML = `
-        <button class="feed" aria-current="${f.feedId === activeFeedId}">
-          ${f.image ? `<img src="${esc(f.image)}" alt="">` : ""}
-          <span class="feed-meta">
-            <span class="feed-title">${esc(f.title)}</span>
-            <span class="feed-sub">${f.episodeCount || 0} episodes${
-              f.lastPolledAt ? ` · checked ${new Date(f.lastPolledAt).toLocaleDateString()}` : " · never checked"
-            }</span>
-          </span>
-        </button>
-        <button class="link-btn" title="Remove feed">remove</button>`;
-      row.querySelector(".feed").onclick = () => selectFeed(f);
-      row.querySelector(".link-btn").onclick = () => removeFeed(f);
-      box.appendChild(row);
-    }
-  } catch (err) {
-    box.innerHTML = `<p class="muted">${esc(err.message)}</p>`;
-  }
+  const data = await api("/feeds");
+  $("feeds").innerHTML = data.feeds.length ? data.feeds.map(f => `
+    <div class="feed"><span class="feed-meta feed-title">${esc(f.url)}</span>
+    <button class="link-btn remove-feed" data-id="${esc(f.feedId)}">Remove</button></div>`).join("")
+    : '<p class="muted">No feeds configured yet.</p>';
+  $("feeds").querySelectorAll(".remove-feed").forEach(button => {
+    button.onclick = async () => {
+      if (!confirm("Remove this feed from future checks? Existing recordings will remain.")) return;
+      try { await api(`/feeds/${button.dataset.id}`, {method:"DELETE"}); await loadFeeds(); }
+      catch(error) { toast(error.message); }
+    };
+  });
 }
-
-async function selectFeed(feed) {
-  activeFeedId = feed.feedId;
-  $("episodes-title").textContent = `Episodes — ${feed.title}`;
-  $("episodes").innerHTML = `<p class="muted">Loading…</p>`;
-  loadFeeds();
-  try {
-    const { episodes } = await api(`/feeds/${feed.feedId}/episodes`);
-    if (!episodes.length) {
-      $("episodes").innerHTML =
-        `<p class="muted">Nothing ingested yet. The poller runs on a schedule — or trigger it now with <code>./scripts/poll-now.sh</code>.</p>`;
-      return;
-    }
-    $("episodes").innerHTML = episodes.map((e) => `
-      <article class="episode">
-        <h3>${esc(e.title)}</h3>
-        <span class="badge ${esc(e.status)}">${esc(e.status)}</span>
-        <span class="muted" style="font-size:.78rem">
-          ${new Date(e.publishedAt).toLocaleDateString()}
-          ${e.wordCount ? ` · ${e.wordCount} words transcribed` : ""}
-        </span>
-        ${(e.topics || []).length
-          ? `<div class="tags">${e.topics.slice(0, 12).map((t) => `<span class="tag">${esc(t)}</span>`).join("")}</div>`
-          : ""}
-      </article>`).join("");
-  } catch (err) {
-    $("episodes").innerHTML = `<p class="muted">${esc(err.message)}</p>`;
-  }
+async function refresh() {
+  if (refreshing || !token()) return;
+  refreshing = true; $("refresh-btn").disabled = true;
+  try { await Promise.all([loadRecordings(), loadBudget()]); }
+  catch(error) { toast(error.message); }
+  finally { refreshing = false; $("refresh-btn").disabled = false; }
 }
-
-async function removeFeed(feed) {
-  if (!confirm(`Remove "${feed.title}"?`)) return;
+$("feed-form").onsubmit = async event => {
+  event.preventDefault();
+  const button = event.target.querySelector("button"); button.disabled = true;
   try {
-    await api(`/feeds/${feed.feedId}`, { method: "DELETE" });
-    if (activeFeedId === feed.feedId) {
-      activeFeedId = null;
-      $("episodes").innerHTML = `<p class="muted">Pick a feed above.</p>`;
-    }
-    loadFeeds();
-  } catch (err) { toast(err.message); }
-}
-
-/* -------------------------------------------------------------- events --- */
-
-$("feed-form").onsubmit = async (e) => {
-  e.preventDefault();
-  const input = $("feed-input");
-  const btn = e.target.querySelector("button");
-  btn.disabled = true;
-  btn.textContent = "Reading feed…";
-  try {
-    const { feed } = await api("/feeds", {
-      method: "POST",
-      body: JSON.stringify({ url: input.value.trim() }),
-    });
-    input.value = "";
-    toast(`Added "${feed.title}".`);
-    loadFeeds();
-  } catch (err) { toast(err.message, 6000); }
-  finally { btn.disabled = false; btn.textContent = "Add feed"; }
+    await api("/feeds", {method:"POST", body:JSON.stringify({
+      url:$("feed-input").value.trim(),
+      allowedHosts:$("hosts-input").value.split(/[\s,]+/).filter(Boolean),
+    })});
+    $("feed-form").reset(); await loadFeeds(); toast("Feed saved. Choose Check feeds now to discover recordings.");
+  } catch(error) { toast(error.message); }
+  finally { button.disabled = false; }
 };
-
-$("search-form").onsubmit = async (e) => {
-  e.preventDefault();
-  const q = $("search-input").value.trim();
-  const box = $("search-results");
-  box.innerHTML = `<p class="muted">Searching…</p>`;
+$("search-form").onsubmit = async event => {
+  event.preventDefault();
+  if (!selectedEpisode) return;
+  const id = selectedEpisode;
   try {
-    const data = await api(`/search?q=${encodeURIComponent(q)}`);
-    box.innerHTML = data.results.length
-      ? data.results.map((r) => `
-          <div class="result">
-            <h3>${esc(r.episodeTitle)}</h3>
-            <p>${esc(r.snippet) || "<em>no transcript excerpt</em>"}</p>
-          </div>`).join("")
-      : `<p class="muted">No episodes mention “${esc(q)}” yet.</p>`;
-  } catch (err) {
-    box.innerHTML = `<p class="muted">${esc(err.message)}</p>`;
-  }
+    const data = await api(`/episodes/${id}/transcript?q=${encodeURIComponent($("search-input").value.trim())}`);
+    if (id !== selectedEpisode) return;
+    $("search-results").innerHTML = data.matches.length ? data.matches.map(m =>
+      `<div class="result"><p>${esc(m.context)}</p></div>`).join("") : '<p class="muted">No matches in this transcript.</p>';
+  } catch(error) { toast(error.message); }
 };
-
-$("auth-btn").onclick = () => (token() ? signOut() : signIn());
-$("signin-cta").onclick = signIn;
-
-/* ---------------------------------------------------------------- boot --- */
-
+$("scan-btn").onclick = async () => {
+  $("scan-btn").disabled = true;
+  try { const data = await api("/scan", {method:"POST", body:"{}"}); toast(data.message); }
+  catch(error) { toast(error.message); }
+  finally { setTimeout(() => { $("scan-btn").disabled = false; }, 30000); }
+};
+$("more-btn").onclick = async () => {
+  $("more-btn").disabled = true;
+  try { await loadRecordings(true); } catch(error) { toast(error.message); }
+  finally { $("more-btn").disabled = false; }
+};
+$("refresh-btn").onclick = refresh;
+$("signin-cta").onclick = () => signIn().catch(error => toast(error.message));
+$("auth-btn").onclick = signOut;
 (async function boot() {
-  const params = new URLSearchParams(location.search);
-  if (params.get("code")) {
-    try {
-      await exchangeCode(params.get("code"));
-    } catch (err) {
-      toast(err.message, 8000);
-    }
-    // Strip the code from the URL so a refresh does not try to redeem it twice.
-    history.replaceState({}, "", location.pathname);
-  } else if (params.get("error")) {
-    toast(`${params.get("error")}: ${params.get("error_description") || ""}`, 8000);
-    history.replaceState({}, "", location.pathname);
+  if (!CFG || !["apiUrl","clientId","redirectUri","hostedUi"].every(k => CFG[k])) {
+    $("signin-cta").disabled = true; $("config-error").hidden = false;
+    $("config-error").textContent = "This site has not been configured yet."; return;
   }
-  render();
+  const params = new URLSearchParams(location.search);
+  try {
+    if (params.get("error")) throw new Error("Sign-in was cancelled or could not be completed.");
+    if (params.get("code")) await exchangeCode(params.get("code"), params.get("state"));
+  } catch(error) { clearSession(); toast(error.message); }
+  finally { if (location.search) history.replaceState({}, "", location.pathname); }
+  if (token()) {
+    $("app").hidden = false; $("signed-out").hidden = true; $("auth-btn").hidden = false;
+    await Promise.all([refresh(), loadFeeds().catch(error => toast(error.message))]);
+  }
+  setInterval(() => { if (!document.hidden && token() && !paginationExpanded) refresh(); }, 15000);
 })();
