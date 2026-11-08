@@ -1,0 +1,17 @@
+.venv/
+.build/
+__pycache__/
+.pytest_cache/
+.env
+*.wav
+*.mp3
+*.m4a
+*.mp4
+*.flac
+*.ogg
+*.zip
+*.pyc
+.aws/
+.env.*
+feeds.local.json
+evidence/

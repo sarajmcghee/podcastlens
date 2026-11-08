@@ -1,0 +1,1809 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "PodcastLens: private RSS/audio transcription lab. No public API. Feed schedule disabled by default.",
+  "Parameters": {
+    "CodeBucket": {
+      "Type": "String"
+    },
+    "CodeKey": {
+      "Type": "String"
+    },
+    "MonthlyCapSeconds": {
+      "Type": "Number",
+      "Default": 600,
+      "MinValue": 15,
+      "MaxValue": 36000
+    },
+    "MaxEpisodeSeconds": {
+      "Type": "Number",
+      "Default": 300,
+      "MinValue": 1,
+      "MaxValue": 3600
+    },
+    "FeedScheduleEnabled": {
+      "Type": "String",
+      "Default": "false",
+      "AllowedValues": [
+        "true",
+        "false"
+      ]
+    },
+    "AlertEmail": {
+      "Type": "String",
+      "Default": ""
+    },
+    "LanguageCode": {
+      "Type": "String",
+      "Default": "en-US",
+      "AllowedValues": [
+        "en-US",
+        "en-GB",
+        "es-US",
+        "fr-FR",
+        "de-DE"
+      ]
+    }
+  },
+  "Conditions": {
+    "HasEmail": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "AlertEmail"
+            },
+            ""
+          ]
+        }
+      ]
+    },
+    "EnableFeeds": {
+      "Fn::Equals": [
+        {
+          "Ref": "FeedScheduleEnabled"
+        },
+        "true"
+      ]
+    }
+  },
+  "Resources": {
+    "InputBucket": {
+      "Type": "AWS::S3::Bucket",
+      "Properties": {
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "IgnorePublicAcls": true,
+          "BlockPublicPolicy": true,
+          "RestrictPublicBuckets": true
+        },
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {
+              "ServerSideEncryptionByDefault": {
+                "SSEAlgorithm": "AES256"
+              }
+            }
+          ]
+        },
+        "LifecycleConfiguration": {
+          "Rules": [
+            {
+              "Id": "ExpireLabMedia",
+              "Status": "Enabled",
+              "ExpirationInDays": 7,
+              "AbortIncompleteMultipartUpload": {
+                "DaysAfterInitiation": 1
+              }
+            }
+          ]
+        },
+        "Tags": [
+          {
+            "Key": "Project",
+            "Value": "PodcastLens"
+          }
+        ]
+      }
+    },
+    "InputBucketPolicy": {
+      "Type": "AWS::S3::BucketPolicy",
+      "Properties": {
+        "Bucket": {
+          "Ref": "InputBucket"
+        },
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "s3:*",
+              "Resource": [
+                {
+                  "Fn::GetAtt": [
+                    "InputBucket",
+                    "Arn"
+                  ]
+                },
+                {
+                  "Fn::Sub": "${InputBucket.Arn}/*"
+                }
+              ],
+              "Condition": {
+                "Bool": {
+                  "aws:SecureTransport": "false"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "OutputBucket": {
+      "Type": "AWS::S3::Bucket",
+      "Properties": {
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "IgnorePublicAcls": true,
+          "BlockPublicPolicy": true,
+          "RestrictPublicBuckets": true
+        },
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {
+              "ServerSideEncryptionByDefault": {
+                "SSEAlgorithm": "AES256"
+              }
+            }
+          ]
+        },
+        "LifecycleConfiguration": {
+          "Rules": [
+            {
+              "Id": "ExpireLabMedia",
+              "Status": "Enabled",
+              "ExpirationInDays": 30,
+              "AbortIncompleteMultipartUpload": {
+                "DaysAfterInitiation": 1
+              }
+            }
+          ]
+        },
+        "Tags": [
+          {
+            "Key": "Project",
+            "Value": "PodcastLens"
+          }
+        ]
+      }
+    },
+    "OutputBucketPolicy": {
+      "Type": "AWS::S3::BucketPolicy",
+      "Properties": {
+        "Bucket": {
+          "Ref": "OutputBucket"
+        },
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "s3:*",
+              "Resource": [
+                {
+                  "Fn::GetAtt": [
+                    "OutputBucket",
+                    "Arn"
+                  ]
+                },
+                {
+                  "Fn::Sub": "${OutputBucket.Arn}/*"
+                }
+              ],
+              "Condition": {
+                "Bool": {
+                  "aws:SecureTransport": "false"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "Episodes": {
+      "Type": "AWS::DynamoDB::Table",
+      "Properties": {
+        "BillingMode": "PAY_PER_REQUEST",
+        "AttributeDefinitions": [
+          {
+            "AttributeName": "pk",
+            "AttributeType": "S"
+          },
+          {
+            "AttributeName": "status",
+            "AttributeType": "S"
+          },
+          {
+            "AttributeName": "updatedAt",
+            "AttributeType": "S"
+          }
+        ],
+        "KeySchema": [
+          {
+            "AttributeName": "pk",
+            "KeyType": "HASH"
+          }
+        ],
+        "GlobalSecondaryIndexes": [
+          {
+            "IndexName": "status-updated",
+            "KeySchema": [
+              {
+                "AttributeName": "status",
+                "KeyType": "HASH"
+              },
+              {
+                "AttributeName": "updatedAt",
+                "KeyType": "RANGE"
+              }
+            ],
+            "Projection": {
+              "ProjectionType": "ALL"
+            }
+          }
+        ],
+        "SSESpecification": {
+          "SSEEnabled": true
+        },
+        "Tags": [
+          {
+            "Key": "Project",
+            "Value": "PodcastLens"
+          }
+        ]
+      }
+    },
+    "JobsDLQ": {
+      "Type": "AWS::SQS::Queue",
+      "Properties": {
+        "SqsManagedSseEnabled": true,
+        "MessageRetentionPeriod": 1209600,
+        "Tags": [
+          {
+            "Key": "Project",
+            "Value": "PodcastLens"
+          }
+        ]
+      }
+    },
+    "OperationsDLQ": {
+      "Type": "AWS::SQS::Queue",
+      "Properties": {
+        "SqsManagedSseEnabled": true,
+        "MessageRetentionPeriod": 1209600,
+        "Tags": [
+          {
+            "Key": "Project",
+            "Value": "PodcastLens"
+          }
+        ]
+      }
+    },
+    "JobsQueue": {
+      "Type": "AWS::SQS::Queue",
+      "Properties": {
+        "SqsManagedSseEnabled": true,
+        "VisibilityTimeout": 720,
+        "MessageRetentionPeriod": 345600,
+        "RedrivePolicy": {
+          "deadLetterTargetArn": {
+            "Fn::GetAtt": [
+              "JobsDLQ",
+              "Arn"
+            ]
+          },
+          "maxReceiveCount": 5
+        },
+        "Tags": [
+          {
+            "Key": "Project",
+            "Value": "PodcastLens"
+          }
+        ]
+      }
+    },
+    "AlarmTopic": {
+      "Type": "AWS::SNS::Topic",
+      "Properties": {
+        "Tags": [
+          {
+            "Key": "Project",
+            "Value": "PodcastLens"
+          }
+        ]
+      }
+    },
+    "EmailSubscription": {
+      "Type": "AWS::SNS::Subscription",
+      "Properties": {
+        "TopicArn": {
+          "Ref": "AlarmTopic"
+        },
+        "Protocol": "email",
+        "Endpoint": {
+          "Ref": "AlertEmail"
+        }
+      },
+      "Condition": "HasEmail"
+    },
+    "TranscribeDataRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "transcribe.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole",
+              "Condition": {
+                "StringEquals": {
+                  "aws:SourceAccount": {
+                    "Ref": "AWS::AccountId"
+                  }
+                },
+                "ArnLike": {
+                  "aws:SourceArn": {
+                    "Fn::Sub": "arn:${AWS::Partition}:transcribe:${AWS::Region}:${AWS::AccountId}:*"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "MediaOnly",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:GetObject"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "${InputBucket.Arn}/audio/*"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:PutObject"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "${OutputBucket.Arn}/transcripts/*"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:GetBucketLocation",
+                    "s3:ListBucket"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::GetAtt": [
+                        "InputBucket",
+                        "Arn"
+                      ]
+                    },
+                    {
+                      "Fn::GetAtt": [
+                        "OutputBucket",
+                        "Arn"
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Project",
+            "Value": "PodcastLens"
+          }
+        ]
+      }
+    },
+    "ScannerLog": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${AWS::StackName}-scanner"
+        },
+        "RetentionInDays": 7,
+        "Tags": [
+          {
+            "Key": "Project",
+            "Value": "PodcastLens"
+          }
+        ]
+      }
+    },
+    "ScannerRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "ScannerRuntime",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "ScannerLog",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "dynamodb:GetItem",
+                    "dynamodb:PutItem",
+                    "dynamodb:UpdateItem"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "Episodes",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:PutObject"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "${InputBucket.Arn}/audio/*"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "sqs:SendMessage"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "JobsQueue",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "sqs:SendMessage"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "OperationsDLQ",
+                      "Arn"
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Project",
+            "Value": "PodcastLens"
+          }
+        ]
+      }
+    },
+    "Scanner": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "FunctionName": {
+          "Fn::Sub": "${AWS::StackName}-scanner"
+        },
+        "Runtime": "python3.12",
+        "Handler": "podcastlens.feeds.scanner",
+        "Role": {
+          "Fn::GetAtt": [
+            "ScannerRole",
+            "Arn"
+          ]
+        },
+        "Code": {
+          "S3Bucket": {
+            "Ref": "CodeBucket"
+          },
+          "S3Key": {
+            "Ref": "CodeKey"
+          }
+        },
+        "Timeout": 300,
+        "MemorySize": 512,
+        "Environment": {
+          "Variables": {
+            "TABLE_NAME": {
+              "Ref": "Episodes"
+            },
+            "INPUT_BUCKET": {
+              "Ref": "InputBucket"
+            },
+            "OUTPUT_BUCKET": {
+              "Ref": "OutputBucket"
+            },
+            "QUEUE_URL": {
+              "Ref": "JobsQueue"
+            },
+            "TRANSCRIBE_ROLE_ARN": {
+              "Fn::GetAtt": [
+                "TranscribeDataRole",
+                "Arn"
+              ]
+            },
+            "MONTHLY_CAP_SECONDS": {
+              "Ref": "MonthlyCapSeconds"
+            },
+            "MAX_EPISODE_SECONDS": {
+              "Ref": "MaxEpisodeSeconds"
+            },
+            "MAX_MEDIA_BYTES": "26214400",
+            "STACK_NAME": {
+              "Ref": "AWS::StackName"
+            },
+            "LANGUAGE_CODE": {
+              "Ref": "LanguageCode"
+            }
+          }
+        },
+        "Tags": [
+          {
+            "Key": "Project",
+            "Value": "PodcastLens"
+          }
+        ]
+      },
+      "DependsOn": [
+        "ScannerLog"
+      ]
+    },
+    "ScannerAsyncFailure": {
+      "Type": "AWS::Lambda::EventInvokeConfig",
+      "Properties": {
+        "FunctionName": {
+          "Ref": "Scanner"
+        },
+        "Qualifier": "$LATEST",
+        "MaximumRetryAttempts": 2,
+        "MaximumEventAgeInSeconds": 3600,
+        "DestinationConfig": {
+          "OnFailure": {
+            "Destination": {
+              "Fn::GetAtt": [
+                "OperationsDLQ",
+                "Arn"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "WorkerLog": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${AWS::StackName}-worker"
+        },
+        "RetentionInDays": 7,
+        "Tags": [
+          {
+            "Key": "Project",
+            "Value": "PodcastLens"
+          }
+        ]
+      }
+    },
+    "WorkerRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "WorkerRuntime",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "WorkerLog",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "dynamodb:GetItem",
+                    "dynamodb:PutItem",
+                    "dynamodb:UpdateItem"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "Episodes",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:GetObject"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "${InputBucket.Arn}/audio/*"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:PutObject"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "${OutputBucket.Arn}/transcripts/*"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:GetBucketLocation",
+                    "s3:ListBucket"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::GetAtt": [
+                        "InputBucket",
+                        "Arn"
+                      ]
+                    },
+                    {
+                      "Fn::GetAtt": [
+                        "OutputBucket",
+                        "Arn"
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "sqs:ReceiveMessage",
+                    "sqs:DeleteMessage",
+                    "sqs:GetQueueAttributes"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "JobsQueue",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "transcribe:StartTranscriptionJob",
+                    "transcribe:GetTranscriptionJob"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:transcribe:${AWS::Region}:${AWS::AccountId}:transcription-job/pl-*"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "iam:PassRole"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "TranscribeDataRole",
+                      "Arn"
+                    ]
+                  },
+                  "Condition": {
+                    "StringEquals": {
+                      "iam:PassedToService": "transcribe.amazonaws.com"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Project",
+            "Value": "PodcastLens"
+          }
+        ]
+      }
+    },
+    "Worker": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "FunctionName": {
+          "Fn::Sub": "${AWS::StackName}-worker"
+        },
+        "Runtime": "python3.12",
+        "Handler": "podcastlens.worker.handler",
+        "Role": {
+          "Fn::GetAtt": [
+            "WorkerRole",
+            "Arn"
+          ]
+        },
+        "Code": {
+          "S3Bucket": {
+            "Ref": "CodeBucket"
+          },
+          "S3Key": {
+            "Ref": "CodeKey"
+          }
+        },
+        "Timeout": 120,
+        "MemorySize": 512,
+        "Environment": {
+          "Variables": {
+            "TABLE_NAME": {
+              "Ref": "Episodes"
+            },
+            "INPUT_BUCKET": {
+              "Ref": "InputBucket"
+            },
+            "OUTPUT_BUCKET": {
+              "Ref": "OutputBucket"
+            },
+            "QUEUE_URL": {
+              "Ref": "JobsQueue"
+            },
+            "TRANSCRIBE_ROLE_ARN": {
+              "Fn::GetAtt": [
+                "TranscribeDataRole",
+                "Arn"
+              ]
+            },
+            "MONTHLY_CAP_SECONDS": {
+              "Ref": "MonthlyCapSeconds"
+            },
+            "MAX_EPISODE_SECONDS": {
+              "Ref": "MaxEpisodeSeconds"
+            },
+            "MAX_MEDIA_BYTES": "26214400",
+            "STACK_NAME": {
+              "Ref": "AWS::StackName"
+            },
+            "LANGUAGE_CODE": {
+              "Ref": "LanguageCode"
+            }
+          }
+        },
+        "Tags": [
+          {
+            "Key": "Project",
+            "Value": "PodcastLens"
+          }
+        ]
+      },
+      "DependsOn": [
+        "WorkerLog"
+      ]
+    },
+    "CollectorLog": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${AWS::StackName}-collector"
+        },
+        "RetentionInDays": 7,
+        "Tags": [
+          {
+            "Key": "Project",
+            "Value": "PodcastLens"
+          }
+        ]
+      }
+    },
+    "CollectorRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "CollectorRuntime",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "CollectorLog",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "dynamodb:GetItem",
+                    "dynamodb:PutItem",
+                    "dynamodb:UpdateItem"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "Episodes",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "transcribe:GetTranscriptionJob"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:transcribe:${AWS::Region}:${AWS::AccountId}:transcription-job/pl-*"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "sqs:SendMessage"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "OperationsDLQ",
+                      "Arn"
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Project",
+            "Value": "PodcastLens"
+          }
+        ]
+      }
+    },
+    "Collector": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "FunctionName": {
+          "Fn::Sub": "${AWS::StackName}-collector"
+        },
+        "Runtime": "python3.12",
+        "Handler": "podcastlens.status.collector",
+        "Role": {
+          "Fn::GetAtt": [
+            "CollectorRole",
+            "Arn"
+          ]
+        },
+        "Code": {
+          "S3Bucket": {
+            "Ref": "CodeBucket"
+          },
+          "S3Key": {
+            "Ref": "CodeKey"
+          }
+        },
+        "Timeout": 30,
+        "MemorySize": 512,
+        "Environment": {
+          "Variables": {
+            "TABLE_NAME": {
+              "Ref": "Episodes"
+            },
+            "INPUT_BUCKET": {
+              "Ref": "InputBucket"
+            },
+            "OUTPUT_BUCKET": {
+              "Ref": "OutputBucket"
+            },
+            "QUEUE_URL": {
+              "Ref": "JobsQueue"
+            },
+            "TRANSCRIBE_ROLE_ARN": {
+              "Fn::GetAtt": [
+                "TranscribeDataRole",
+                "Arn"
+              ]
+            },
+            "MONTHLY_CAP_SECONDS": {
+              "Ref": "MonthlyCapSeconds"
+            },
+            "MAX_EPISODE_SECONDS": {
+              "Ref": "MaxEpisodeSeconds"
+            },
+            "MAX_MEDIA_BYTES": "26214400",
+            "STACK_NAME": {
+              "Ref": "AWS::StackName"
+            },
+            "LANGUAGE_CODE": {
+              "Ref": "LanguageCode"
+            }
+          }
+        },
+        "Tags": [
+          {
+            "Key": "Project",
+            "Value": "PodcastLens"
+          }
+        ]
+      },
+      "DependsOn": [
+        "CollectorLog"
+      ]
+    },
+    "CollectorAsyncFailure": {
+      "Type": "AWS::Lambda::EventInvokeConfig",
+      "Properties": {
+        "FunctionName": {
+          "Ref": "Collector"
+        },
+        "Qualifier": "$LATEST",
+        "MaximumRetryAttempts": 2,
+        "MaximumEventAgeInSeconds": 3600,
+        "DestinationConfig": {
+          "OnFailure": {
+            "Destination": {
+              "Fn::GetAtt": [
+                "OperationsDLQ",
+                "Arn"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "ReconcilerLog": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${AWS::StackName}-reconciler"
+        },
+        "RetentionInDays": 7,
+        "Tags": [
+          {
+            "Key": "Project",
+            "Value": "PodcastLens"
+          }
+        ]
+      }
+    },
+    "ReconcilerRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "ReconcilerRuntime",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "ReconcilerLog",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "dynamodb:GetItem",
+                    "dynamodb:PutItem",
+                    "dynamodb:UpdateItem"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "Episodes",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "dynamodb:Query"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "${Episodes.Arn}/index/status-updated"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "sqs:SendMessage"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "JobsQueue",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "transcribe:GetTranscriptionJob"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:transcribe:${AWS::Region}:${AWS::AccountId}:transcription-job/pl-*"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "sqs:SendMessage"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "OperationsDLQ",
+                      "Arn"
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Project",
+            "Value": "PodcastLens"
+          }
+        ]
+      }
+    },
+    "Reconciler": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "FunctionName": {
+          "Fn::Sub": "${AWS::StackName}-reconciler"
+        },
+        "Runtime": "python3.12",
+        "Handler": "podcastlens.status.reconcile",
+        "Role": {
+          "Fn::GetAtt": [
+            "ReconcilerRole",
+            "Arn"
+          ]
+        },
+        "Code": {
+          "S3Bucket": {
+            "Ref": "CodeBucket"
+          },
+          "S3Key": {
+            "Ref": "CodeKey"
+          }
+        },
+        "Timeout": 300,
+        "MemorySize": 512,
+        "Environment": {
+          "Variables": {
+            "TABLE_NAME": {
+              "Ref": "Episodes"
+            },
+            "INPUT_BUCKET": {
+              "Ref": "InputBucket"
+            },
+            "OUTPUT_BUCKET": {
+              "Ref": "OutputBucket"
+            },
+            "QUEUE_URL": {
+              "Ref": "JobsQueue"
+            },
+            "TRANSCRIBE_ROLE_ARN": {
+              "Fn::GetAtt": [
+                "TranscribeDataRole",
+                "Arn"
+              ]
+            },
+            "MONTHLY_CAP_SECONDS": {
+              "Ref": "MonthlyCapSeconds"
+            },
+            "MAX_EPISODE_SECONDS": {
+              "Ref": "MaxEpisodeSeconds"
+            },
+            "MAX_MEDIA_BYTES": "26214400",
+            "STACK_NAME": {
+              "Ref": "AWS::StackName"
+            },
+            "LANGUAGE_CODE": {
+              "Ref": "LanguageCode"
+            }
+          }
+        },
+        "Tags": [
+          {
+            "Key": "Project",
+            "Value": "PodcastLens"
+          }
+        ]
+      },
+      "DependsOn": [
+        "ReconcilerLog"
+      ]
+    },
+    "ReconcilerAsyncFailure": {
+      "Type": "AWS::Lambda::EventInvokeConfig",
+      "Properties": {
+        "FunctionName": {
+          "Ref": "Reconciler"
+        },
+        "Qualifier": "$LATEST",
+        "MaximumRetryAttempts": 2,
+        "MaximumEventAgeInSeconds": 3600,
+        "DestinationConfig": {
+          "OnFailure": {
+            "Destination": {
+              "Fn::GetAtt": [
+                "OperationsDLQ",
+                "Arn"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "WorkerMapping": {
+      "Type": "AWS::Lambda::EventSourceMapping",
+      "Properties": {
+        "FunctionName": {
+          "Ref": "Worker"
+        },
+        "EventSourceArn": {
+          "Fn::GetAtt": [
+            "JobsQueue",
+            "Arn"
+          ]
+        },
+        "BatchSize": 5,
+        "FunctionResponseTypes": [
+          "ReportBatchItemFailures"
+        ],
+        "ScalingConfig": {
+          "MaximumConcurrency": 2
+        },
+        "Enabled": true
+      }
+    },
+    "FeedSchedule": {
+      "Type": "AWS::Events::Rule",
+      "Properties": {
+        "ScheduleExpression": "rate(1 hour)",
+        "State": {
+          "Fn::If": [
+            "EnableFeeds",
+            "ENABLED",
+            "DISABLED"
+          ]
+        },
+        "Targets": [
+          {
+            "Id": "Scanner",
+            "Arn": {
+              "Fn::GetAtt": [
+                "Scanner",
+                "Arn"
+              ]
+            },
+            "DeadLetterConfig": {
+              "Arn": {
+                "Fn::GetAtt": [
+                  "OperationsDLQ",
+                  "Arn"
+                ]
+              }
+            },
+            "RetryPolicy": {
+              "MaximumEventAgeInSeconds": 3600,
+              "MaximumRetryAttempts": 5
+            }
+          }
+        ]
+      }
+    },
+    "FeedSchedulePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "FunctionName": {
+          "Ref": "Scanner"
+        },
+        "Action": "lambda:InvokeFunction",
+        "Principal": "events.amazonaws.com",
+        "SourceArn": {
+          "Fn::GetAtt": [
+            "FeedSchedule",
+            "Arn"
+          ]
+        },
+        "SourceAccount": {
+          "Ref": "AWS::AccountId"
+        }
+      }
+    },
+    "RecoverySchedule": {
+      "Type": "AWS::Events::Rule",
+      "Properties": {
+        "ScheduleExpression": "rate(5 minutes)",
+        "State": "ENABLED",
+        "Targets": [
+          {
+            "Id": "Reconciler",
+            "Arn": {
+              "Fn::GetAtt": [
+                "Reconciler",
+                "Arn"
+              ]
+            },
+            "DeadLetterConfig": {
+              "Arn": {
+                "Fn::GetAtt": [
+                  "OperationsDLQ",
+                  "Arn"
+                ]
+              }
+            },
+            "RetryPolicy": {
+              "MaximumEventAgeInSeconds": 3600,
+              "MaximumRetryAttempts": 5
+            }
+          }
+        ]
+      }
+    },
+    "RecoverySchedulePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "FunctionName": {
+          "Ref": "Reconciler"
+        },
+        "Action": "lambda:InvokeFunction",
+        "Principal": "events.amazonaws.com",
+        "SourceArn": {
+          "Fn::GetAtt": [
+            "RecoverySchedule",
+            "Arn"
+          ]
+        },
+        "SourceAccount": {
+          "Ref": "AWS::AccountId"
+        }
+      }
+    },
+    "TranscribeEvents": {
+      "Type": "AWS::Events::Rule",
+      "Properties": {
+        "EventPattern": {
+          "source": [
+            "aws.transcribe"
+          ],
+          "detail-type": [
+            "Transcribe Job State Change"
+          ],
+          "detail": {
+            "TranscriptionJobStatus": [
+              "COMPLETED",
+              "FAILED"
+            ]
+          }
+        },
+        "Targets": [
+          {
+            "Id": "Collector",
+            "Arn": {
+              "Fn::GetAtt": [
+                "Collector",
+                "Arn"
+              ]
+            },
+            "DeadLetterConfig": {
+              "Arn": {
+                "Fn::GetAtt": [
+                  "OperationsDLQ",
+                  "Arn"
+                ]
+              }
+            },
+            "RetryPolicy": {
+              "MaximumEventAgeInSeconds": 3600,
+              "MaximumRetryAttempts": 5
+            }
+          }
+        ]
+      }
+    },
+    "TranscribeEventsPermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "FunctionName": {
+          "Ref": "Collector"
+        },
+        "Action": "lambda:InvokeFunction",
+        "Principal": "events.amazonaws.com",
+        "SourceArn": {
+          "Fn::GetAtt": [
+            "TranscribeEvents",
+            "Arn"
+          ]
+        },
+        "SourceAccount": {
+          "Ref": "AWS::AccountId"
+        }
+      }
+    },
+    "OperationsQueuePolicy": {
+      "Type": "AWS::SQS::QueuePolicy",
+      "Properties": {
+        "Queues": [
+          {
+            "Ref": "OperationsDLQ"
+          }
+        ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "events.amazonaws.com"
+              },
+              "Action": "sqs:SendMessage",
+              "Resource": {
+                "Fn::GetAtt": [
+                  "OperationsDLQ",
+                  "Arn"
+                ]
+              },
+              "Condition": {
+                "ArnEquals": {
+                  "aws:SourceArn": [
+                    {
+                      "Fn::GetAtt": [
+                        "FeedSchedule",
+                        "Arn"
+                      ]
+                    },
+                    {
+                      "Fn::GetAtt": [
+                        "RecoverySchedule",
+                        "Arn"
+                      ]
+                    },
+                    {
+                      "Fn::GetAtt": [
+                        "TranscribeEvents",
+                        "Arn"
+                      ]
+                    }
+                  ]
+                },
+                "StringEquals": {
+                  "aws:SourceAccount": {
+                    "Ref": "AWS::AccountId"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "JobsDLQAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmDescription": "PodcastLens: investigate using docs/RUNBOOK.md",
+        "Namespace": "AWS/SQS",
+        "MetricName": "ApproximateNumberOfMessagesVisible",
+        "Dimensions": [
+          {
+            "Name": "QueueName",
+            "Value": {
+              "Fn::GetAtt": [
+                "JobsDLQ",
+                "QueueName"
+              ]
+            }
+          }
+        ],
+        "Statistic": "Maximum",
+        "Period": 300,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "AlarmTopic"
+          }
+        ]
+      }
+    },
+    "OperationsDLQAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmDescription": "PodcastLens: investigate using docs/RUNBOOK.md",
+        "Namespace": "AWS/SQS",
+        "MetricName": "ApproximateNumberOfMessagesVisible",
+        "Dimensions": [
+          {
+            "Name": "QueueName",
+            "Value": {
+              "Fn::GetAtt": [
+                "OperationsDLQ",
+                "QueueName"
+              ]
+            }
+          }
+        ],
+        "Statistic": "Maximum",
+        "Period": 300,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "AlarmTopic"
+          }
+        ]
+      }
+    },
+    "QueueAgeAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmDescription": "PodcastLens: investigate using docs/RUNBOOK.md",
+        "Namespace": "AWS/SQS",
+        "MetricName": "ApproximateAgeOfOldestMessage",
+        "Dimensions": [
+          {
+            "Name": "QueueName",
+            "Value": {
+              "Fn::GetAtt": [
+                "JobsQueue",
+                "QueueName"
+              ]
+            }
+          }
+        ],
+        "Statistic": "Maximum",
+        "Period": 300,
+        "EvaluationPeriods": 1,
+        "Threshold": 900,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "AlarmTopic"
+          }
+        ]
+      }
+    },
+    "WorkerFailuresAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmDescription": "PodcastLens: investigate using docs/RUNBOOK.md",
+        "Namespace": "PodcastLens",
+        "MetricName": "WorkerFailures",
+        "Dimensions": [
+          {
+            "Name": "Stack",
+            "Value": {
+              "Ref": "AWS::StackName"
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 300,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "AlarmTopic"
+          }
+        ]
+      }
+    },
+    "FeedFailuresAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmDescription": "PodcastLens: investigate using docs/RUNBOOK.md",
+        "Namespace": "PodcastLens",
+        "MetricName": "FeedFailures",
+        "Dimensions": [
+          {
+            "Name": "Stack",
+            "Value": {
+              "Ref": "AWS::StackName"
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 300,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "AlarmTopic"
+          }
+        ]
+      }
+    },
+    "StaleJobsAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmDescription": "PodcastLens: investigate using docs/RUNBOOK.md",
+        "Namespace": "PodcastLens",
+        "MetricName": "StaleJobs",
+        "Dimensions": [
+          {
+            "Name": "Stack",
+            "Value": {
+              "Ref": "AWS::StackName"
+            }
+          }
+        ],
+        "Statistic": "Maximum",
+        "Period": 300,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "AlarmTopic"
+          }
+        ]
+      }
+    },
+    "TranscriptionFailuresAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmDescription": "PodcastLens: investigate using docs/RUNBOOK.md",
+        "Namespace": "PodcastLens",
+        "MetricName": "TranscriptionFailures",
+        "Dimensions": [
+          {
+            "Name": "Stack",
+            "Value": {
+              "Ref": "AWS::StackName"
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 300,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "AlarmTopic"
+          }
+        ]
+      }
+    }
+  },
+  "Outputs": {
+    "TABLENAME": {
+      "Value": {
+        "Ref": "Episodes"
+      },
+      "Description": "TABLE_NAME"
+    },
+    "INPUTBUCKET": {
+      "Value": {
+        "Ref": "InputBucket"
+      },
+      "Description": "INPUT_BUCKET"
+    },
+    "OUTPUTBUCKET": {
+      "Value": {
+        "Ref": "OutputBucket"
+      },
+      "Description": "OUTPUT_BUCKET"
+    },
+    "QUEUEURL": {
+      "Value": {
+        "Ref": "JobsQueue"
+      },
+      "Description": "QUEUE_URL"
+    },
+    "TRANSCRIBEROLEARN": {
+      "Value": {
+        "Fn::GetAtt": [
+          "TranscribeDataRole",
+          "Arn"
+        ]
+      },
+      "Description": "TRANSCRIBE_ROLE_ARN"
+    },
+    "MONTHLYCAPSECONDS": {
+      "Value": {
+        "Ref": "MonthlyCapSeconds"
+      },
+      "Description": "MONTHLY_CAP_SECONDS"
+    },
+    "MAXEPISODESECONDS": {
+      "Value": {
+        "Ref": "MaxEpisodeSeconds"
+      },
+      "Description": "MAX_EPISODE_SECONDS"
+    },
+    "MAXMEDIABYTES": {
+      "Value": "26214400",
+      "Description": "MAX_MEDIA_BYTES"
+    },
+    "STACKNAME": {
+      "Value": {
+        "Ref": "AWS::StackName"
+      },
+      "Description": "STACK_NAME"
+    },
+    "LANGUAGECODE": {
+      "Value": {
+        "Ref": "LanguageCode"
+      },
+      "Description": "LANGUAGE_CODE"
+    },
+    "SCANNERFUNCTION": {
+      "Value": {
+        "Ref": "Scanner"
+      },
+      "Description": "SCANNER_FUNCTION"
+    },
+    "RECONCILERFUNCTION": {
+      "Value": {
+        "Ref": "Reconciler"
+      },
+      "Description": "RECONCILER_FUNCTION"
+    },
+    "WORKERFUNCTION": {
+      "Value": {
+        "Ref": "Worker"
+      },
+      "Description": "WORKER_FUNCTION"
+    },
+    "JOBSDLQURL": {
+      "Value": {
+        "Ref": "JobsDLQ"
+      },
+      "Description": "JOBS_DLQ_URL"
+    },
+    "JOBSDLQARN": {
+      "Value": {
+        "Fn::GetAtt": [
+          "JobsDLQ",
+          "Arn"
+        ]
+      },
+      "Description": "JOBS_DLQ_ARN"
+    },
+    "JOBSQUEUEARN": {
+      "Value": {
+        "Fn::GetAtt": [
+          "JobsQueue",
+          "Arn"
+        ]
+      },
+      "Description": "JOBS_QUEUE_ARN"
+    },
+    "OPERATIONSDLQURL": {
+      "Value": {
+        "Ref": "OperationsDLQ"
+      },
+      "Description": "OPERATIONS_DLQ_URL"
+    },
+    "FEEDSCHEDULE": {
+      "Value": {
+        "Ref": "FeedSchedule"
+      },
+      "Description": "FEED_SCHEDULE"
+    },
+    "ALARMTOPICARN": {
+      "Value": {
+        "Ref": "AlarmTopic"
+      },
+      "Description": "ALARM_TOPIC_ARN"
+    }
+  }
+}
