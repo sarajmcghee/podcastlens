@@ -25,13 +25,17 @@ SHA-256:
 Local checks on the integrated repository:
 - Backend/API pytest suite: **55 passed** (36 original tests plus 19 API checks).
 - Existing backend tests under `legacy/`: **17 passed**.
+- Deployment contract checks: **3 passed**.
 - Both pipeline and web CloudFormation templates: lint passed.
 - Python deployment-script compilation, shell/JavaScript syntax, workflow YAML,
   CLI help and diff whitespace checks passed.
 - Browser suite added for signed-out access, existing recording/status/budget
   display, safe transcript rendering/search, feed/scan requests, session expiry,
   PKCE and OAuth state handling. Local Chromium startup was blocked by the
-  execution environment's socket restrictions; GitHub Actions runs these checks.
+  execution environment's socket restrictions. All **6 browser checks passed in
+  GitHub Actions**, along with the backend and deployment checks, in
+  [run 42493338452](https://github.com/sarajmcghee/podcastlens/actions/runs/42493338452)
+  for implementation commit `4b37d9be5e2b5c93cfbd6ceddabc60e0751d8531`.
 
 The backend suite uses Moto for storage/queue integration and a deterministic
 Transcribe fake. It covers identity, duplicate delivery, media validation,
