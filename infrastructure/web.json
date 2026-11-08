@@ -242,6 +242,10 @@
         "AdminCreateUserConfig": {
           "AllowAdminCreateUserOnly": true
         },
+        "MfaConfiguration": "ON",
+        "EnabledMfas": [
+          "SOFTWARE_TOKEN_MFA"
+        ],
         "Policies": {
           "PasswordPolicy": {
             "MinimumLength": 12,

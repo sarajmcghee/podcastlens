@@ -5,7 +5,8 @@ The frontend keeps the existing PodcastLens styling and now reads the same
 DynamoDB episode records and S3 transcripts used by the deployed Python pipeline.
 
 The pipeline is deployed as **`podcast-lense-dev` in `us-east-1`**.
-The dashboard integration still needs deployment and a live sign-in smoke test.
+The dashboard has been deployed and its owner reported successful sign-in.
+Authenticator MFA requires applying the updated web template and completing enrollment.
 See the [validation record](backend/docs/VALIDATION.md) for observed results.
 
 ## Dashboard
@@ -17,6 +18,7 @@ See the [validation record](backend/docs/VALIDATION.md) for observed results.
 - Shows reserved seconds and the current cap from the existing pipeline.
 - Manages the scanner's existing feed configuration, including allowed audio
   hosts, and requests manual scans.
+- Requires authenticator-app MFA in the Cognito deployment template.
 - Uses Cognito code-flow sign-in with PKCE and state verification. API Gateway
   requires an access token and scope; the API also requires the operators group.
 
@@ -44,11 +46,11 @@ The original pipeline template and processing modules remain unchanged.
 ## Connect the website
 
 In CloudShell, use a non-root administrative login in the pipeline's region.
-While the pull request is open:
+Clone the current main branch:
 
 ```bash
-git clone --branch codex/deployed-backend-2026-11-08 https://github.com/sarajmcghee/podcastlens.git podcastlens-review
-cd podcastlens-review
+git clone --branch main https://github.com/sarajmcghee/podcastlens.git podcastlens-dashboard
+cd podcastlens-dashboard
 bash scripts/deploy.sh podcast-lense-dev us-east-1
 ```
 
@@ -68,24 +70,65 @@ python3 scripts/create_user.py your-email@example.com podcast-lense-dev us-east-
 ```
 
 New users receive a Cognito invitation email. Open the printed website URL,
-sign in, set the requested password and inspect an existing recording.
+sign in, set the requested password, enroll an authenticator app when prompted,
+and inspect an existing recording.
 Only invite people who should read all recordings and manage feeds.
 
 A GitHub push or merge does not deploy to AWS. CI has no deployment job or AWS
 credentials. Run the deployment command to apply the integration.
 
+## Require MFA on the existing dashboard
+
+From a fresh clone of main in CloudShell, apply the updated template to the
+existing companion stack. The CLI retains the stack's existing parameter values,
+including the deployed API package. This update enables required TOTP MFA on the
+existing user pool; it does not create replacement accounts.
+
+```bash
+aws cloudformation deploy \
+  --region us-east-1 \
+  --stack-name podcast-lense-dev-web \
+  --template-file infrastructure/web.json \
+  --capabilities CAPABILITY_IAM \
+  --no-fail-on-empty-changeset \
+  --no-cli-pager
+```
+
+After the stack update succeeds, sign out of the dashboard and sign in again.
+Complete the authenticator-app setup on the Cognito sign-in page: scan its QR
+code and enter the current code from the authenticator. Keep the QR code, setup
+secret and one-time codes private. Sign out and sign in once more to confirm the
+authenticator code is required after the password. Existing issued access tokens
+can remain valid until expiry (one hour in this template).
+
+Verify the pool setting in CloudShell:
+
+```bash
+PODCASTLENS_POOL_ID=$(aws cloudformation describe-stacks \
+  --region us-east-1 --stack-name podcast-lense-dev-web \
+  --query 'Stacks[0].Outputs[?OutputKey==`UserPoolId`].OutputValue | [0]' \
+  --output text --no-cli-pager)
+aws cognito-idp get-user-pool-mfa-config \
+  --region us-east-1 --user-pool-id "$PODCASTLENS_POOL_ID" \
+  --no-cli-pager
+```
+
+Expected: `MfaConfiguration` is `ON` and `SoftwareTokenMfaConfiguration.Enabled`
+is `true`. This protects dashboard sign-in. AWS root/IAM console MFA is configured
+separately. GitHub tests cannot confirm live deployment or personal enrollment.
+
 ## First live checks
 
 1. Open the website signed out; recordings must not be visible.
-2. Sign in with the invited operator and find an existing completed recording.
+2. Sign in with the invited operator, complete authenticator MFA and find an existing completed recording.
 3. Read its transcript and search for a recorded word.
 4. Compare status and reserved seconds with the CLI.
 5. Confirm an API request without a token is rejected.
 6. Save a permitted feed, request a scan and observe the existing pipeline.
 7. Sign out and confirm recordings and transcript text disappear.
 
-These are pending until performed in AWS. Backend test results do not establish
-that the new Cognito/API/CloudFront integration has been deployed.
+Track each live check separately. Successful deployment and owner-reported sign-in
+do not establish that every acceptance check or MFA enrollment has been completed.
 
 ## Tests
 
