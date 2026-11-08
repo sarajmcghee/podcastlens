@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# Deploy PodcastLens end to end. Safe to re-run; CloudFormation works out the diff.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+source scripts/config.sh
+
+if [[ -z "$NOTIFY_EMAIL" ]]; then
+  echo "Set NOTIFY_EMAIL first, e.g.:" >&2
+  echo "  NOTIFY_EMAIL=you@example.com ./scripts/deploy.sh" >&2
+  exit 1
+fi
+
+echo "==> account $ACCOUNT_ID  region $REGION  project $PROJECT"
+
+# A stack whose very first CREATE failed sits in ROLLBACK_COMPLETE. That state
+# cannot be updated - CloudFormation will only let you delete it. Clear it out
+# so a re-run after a failed first deploy just works.
+clear_failed_stack() {
+  local stack="$1" status
+  status="$(aws cloudformation describe-stacks --stack-name "$stack" --region "$REGION" \
+    --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo NONE)"
+  case "$status" in
+    ROLLBACK_COMPLETE|ROLLBACK_FAILED|REVIEW_IN_PROGRESS)
+      echo "==> $stack is in $status and cannot be updated; deleting it first"
+      aws cloudformation delete-stack --stack-name "$stack" --region "$REGION"
+      aws cloudformation wait stack-delete-complete --stack-name "$stack" --region "$REGION"
+      ;;
+    *_IN_PROGRESS)
+      echo "==> waiting for in-flight operation on $stack ($status)"
+      aws cloudformation wait stack-create-complete --stack-name "$stack" --region "$REGION" 2>/dev/null || true
+      aws cloudformation wait stack-rollback-complete --stack-name "$stack" --region "$REGION" 2>/dev/null || true
+      clear_failed_stack "$stack"
+      ;;
+  esac
+}
+
+for STACK in "$AUTH_STACK" "$CORE_STACK" "$WEB_STACK"; do clear_failed_stack "$STACK"; done
+
+# ---------------------------------------------------------------------------
+# 0. An S3 bucket to hold packaged Lambda zips. CloudFormation cannot upload
+#    local code itself - `package` puts the zip in S3 and rewrites the template
+#    to point at it.
+# ---------------------------------------------------------------------------
+if ! aws s3api head-bucket --bucket "$ARTIFACT_BUCKET" 2>/dev/null; then
+  echo "==> creating artifact bucket $ARTIFACT_BUCKET"
+  aws s3 mb "s3://$ARTIFACT_BUCKET" --region "$REGION"
+  aws s3api put-public-access-block --bucket "$ARTIFACT_BUCKET" \
+    --public-access-block-configuration \
+    "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
+fi
+
+# ---------------------------------------------------------------------------
+# 1. Identity. Deployed first because the API's authorizer needs the user pool
+#    to exist before it can reference it.
+# ---------------------------------------------------------------------------
+echo "==> [1/4] auth stack"
+aws cloudformation deploy \
+  --template-file infrastructure/01-auth.yaml \
+  --stack-name "$AUTH_STACK" --region "$REGION" \
+  --parameter-overrides "ProjectName=$PROJECT" \
+  --no-fail-on-empty-changeset
+
+# ---------------------------------------------------------------------------
+# 2. Data, compute and pipeline.
+# ---------------------------------------------------------------------------
+echo "==> [2/4] core stack (packaging Lambda source)"
+aws cloudformation package \
+  --template-file infrastructure/02-core.yaml \
+  --s3-bucket "$ARTIFACT_BUCKET" --s3-prefix core \
+  --region "$REGION" \
+  --output-template-file .packaged-core.yaml >/dev/null
+
+aws cloudformation deploy \
+  --template-file .packaged-core.yaml \
+  --stack-name "$CORE_STACK" --region "$REGION" \
+  --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
+  --parameter-overrides \
+    "ProjectName=$PROJECT" \
+    "NotificationEmail=$NOTIFY_EMAIL" \
+    "PollRateMinutes=$POLL_RATE_MINUTES" \
+    "ClipSeconds=$CLIP_SECONDS" \
+    "MonthlyTranscribeSeconds=$MONTHLY_TRANSCRIBE_SECONDS" \
+    "MonthlyBudgetUsd=$MONTHLY_BUDGET_USD" \
+  --no-fail-on-empty-changeset
+
+# ---------------------------------------------------------------------------
+# 3. CDN and static site.
+# ---------------------------------------------------------------------------
+echo "==> [3/4] web stack (CloudFront can take 5-10 minutes on first create)"
+aws cloudformation deploy \
+  --template-file infrastructure/03-web.yaml \
+  --stack-name "$WEB_STACK" --region "$REGION" \
+  --parameter-overrides "ProjectName=$PROJECT" \
+  --no-fail-on-empty-changeset
+
+SITE_URL="$(stack_output "$WEB_STACK" SiteUrl)"
+SITE_BUCKET="$(stack_output "$WEB_STACK" SiteBucketName)"
+DIST_ID="$(stack_output "$WEB_STACK" DistributionId)"
+API_URL="$(stack_output "$CORE_STACK" ApiUrl)"
+CLIENT_ID="$(stack_output "$AUTH_STACK" UserPoolClientId)"
+HOSTED_UI="$(stack_output "$AUTH_STACK" HostedUiDomain)"
+
+# ---------------------------------------------------------------------------
+# 4. The chicken-and-egg step. Cognito needs to know the CloudFront URL to allow
+#    it as a sign-in redirect target, but that URL did not exist until step 3.
+#    So we come back and update stack 1 now that we know it.
+# ---------------------------------------------------------------------------
+echo "==> [4/4] pointing Cognito callbacks at $SITE_URL"
+aws cloudformation deploy \
+  --template-file infrastructure/01-auth.yaml \
+  --stack-name "$AUTH_STACK" --region "$REGION" \
+  --parameter-overrides "ProjectName=$PROJECT" "CallbackUrl=$SITE_URL/" \
+  --no-fail-on-empty-changeset
+
+# ---------------------------------------------------------------------------
+# 5. Publish the front end. config.js is generated, never committed - it is the
+#    only file that differs between deployments.
+# ---------------------------------------------------------------------------
+cat > web/config.js <<EOF
+/* Generated by scripts/deploy.sh. Do not edit; do not commit. */
+window.PODCASTLENS_CONFIG = {
+  apiUrl: "$API_URL",
+  clientId: "$CLIENT_ID",
+  hostedUi: "$HOSTED_UI",
+  redirectUri: "$SITE_URL/",
+};
+EOF
+
+echo "==> uploading site to $SITE_BUCKET"
+# Hashed asset names would let us cache these forever. With fixed filenames we
+# have to tell CloudFront to revalidate, or a deploy would not reach anyone.
+aws s3 sync web/ "s3://$SITE_BUCKET/" --delete \
+  --cache-control "public,max-age=60,must-revalidate" --region "$REGION"
+
+aws cloudfront create-invalidation --distribution-id "$DIST_ID" --paths "/*" \
+  --query 'Invalidation.Id' --output text >/dev/null
+
+rm -f .packaged-core.yaml
+
+cat <<EOF
+
+  Deployed.
+
+  Site        $SITE_URL
+  API         $API_URL
+  Sign-in     $HOSTED_UI
+
+  Next:
+    1. Confirm the SNS subscription email AWS just sent to $NOTIFY_EMAIL.
+    2. Create your login:      ./scripts/create-user.sh $NOTIFY_EMAIL
+    3. Open $SITE_URL and add a feed.
+    4. Force an immediate poll: ./scripts/poll-now.sh
+
+EOF

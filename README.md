@@ -1,170 +1,129 @@
 # PodcastLens
 
-A serverless podcast transcription and search engine, built as a study project
-for the **AWS Certified Solutions Architect – Associate (SAA-C03)** exam.
+A podcast transcription pipeline with an authenticated operator dashboard.
+The frontend keeps the existing PodcastLens styling and now reads the same
+DynamoDB episode records and S3 transcripts used by the deployed Python pipeline.
 
-You subscribe to a podcast feed. On a schedule, PodcastLens notices new
-episodes, transcribes them with Amazon Transcribe, pulls out the topics and
-named entities with Amazon Comprehend, and gives you a searchable archive plus a
-weekly email digest.
+The pipeline is deployed as **`podcast-lense-dev` in `us-east-1`**.
+The dashboard integration still needs deployment and a live sign-in smoke test.
+See the [validation record](backend/docs/VALIDATION.md) for observed results.
 
-It runs at effectively **$0/month** inside the AWS free tier, and it deliberately
-touches most of the services the exam actually asks about.
+## Dashboard
 
----
+- Shows recordings from CLI uploads and feed discovery with their actual
+  processing, completion, failure or budget-blocked status.
+- Refreshes the first page every 15 seconds while visible and supports pagination.
+- Reads completed transcripts and searches within a selected transcript.
+- Shows reserved seconds and the current cap from the existing pipeline.
+- Manages the scanner's existing feed configuration, including allowed audio
+  hosts, and requests manual scans.
+- Uses Cognito code-flow sign-in with PKCE and state verification. API Gateway
+  requires an access token and scope; the API also requires the operators group.
 
-## The architecture
-
-```
-                    EventBridge Scheduler  ──(every 6h)──┐
-                                                         ▼
-  ┌──────────┐   HTTPS    ┌────────────┐          ┌─────────────┐
-  │ Browser  │───────────▶│ CloudFront │          │  Poller λ   │
-  └────┬─────┘            └─────┬──────┘          └──────┬──────┘
-       │                        │ OAC                    │ new episodes
-       │ OAuth2 + PKCE          ▼                        ▼
-       │                  ┌──────────┐            ┌─────────────┐
-       ▼                  │ S3 site  │            │  SQS queue  │──▶ DLQ
-  ┌──────────┐            │ (private)│            └──────┬──────┘
-  │ Cognito  │            └──────────┘                   │
-  └────┬─────┘                                           ▼
-       │ JWT                                      ┌─────────────┐
-       ▼                                          │ Processor λ │
-  ┌─────────────┐        ┌──────────┐             └──────┬──────┘
-  │ API Gateway │───────▶│  API λ   │                    │ clip → S3
-  │  (HTTP API) │        └────┬─────┘                    ▼
-  └─────────────┘             │              ┌───────────────────────┐
-                              │              │   Amazon Transcribe   │
-                              ▼              └───────────┬───────────┘
-                       ┌────────────┐                    │ job state change
-                       │  DynamoDB  │◀───────┐           ▼
-                       │  (1 table) │        │    ┌──────────────┐
-                       └────────────┘        └────│ Completer λ  │
-                                                  └──────┬───────┘
-                       ┌────────────┐                    │
-                       │ S3 media   │◀───────────────────┤ topics
-                       │ transcripts│                    ▼
-                       └────────────┘             ┌────────────┐
-                                                  │ Comprehend │
-                       ┌────────────┐             └────────────┘
-                       │  SNS ──▶ 📧│◀── CloudWatch Alarms, Budgets
-                       └────────────┘
-```
-
-Nothing in this diagram is ever idle-billed. There are no servers, no load
-balancers, and no NAT gateways — which is also why it costs nothing when you
-are not using it.
-
----
-
-## Getting it running
-
-**Prerequisites:** the AWS CLI, configured with credentials. That's it — there
-is no build step, no Docker, and no SAM CLI. Every Lambda uses only the Python
-standard library plus the `boto3` that AWS already ships in the runtime.
-
-```bash
-NOTIFY_EMAIL=you@example.com ./scripts/deploy.sh
-```
-
-That takes about 10 minutes the first time, almost all of it CloudFront. Then:
-
-```bash
-./scripts/create-user.sh you@example.com   # Cognito emails you a temp password
-```
-
-Confirm the SNS subscription email AWS sends you, open the site URL the deploy
-printed, sign in, and add a feed:
-
-```
-https://lexfridman.com/feed/podcast/
-```
-
-Episodes appear on the next scheduled poll, or immediately with:
-
-```bash
-./scripts/poll-now.sh
-./scripts/status.sh      # watch NEW → DOWNLOADING → TRANSCRIBING → READY
-```
-
----
-
-## About long episodes
-
-Transcribe's free tier is **60 audio-minutes per month**. A single four-hour Lex
-Fridman episode is 240 minutes — four times your entire monthly allowance, and
-about $5.75 at the standard rate.
-
-So by default PodcastLens transcribes only the **first 10 minutes** of each
-episode. It does this with an HTTP `Range` request, downloading just the first
-few megabytes of the MP3: an MP3 is a flat sequence of independent frames, so a
-prefix of the file is still perfectly playable audio that simply stops early.
-
-Six clips per month therefore fit inside the free tier with room to spare. Two
-independent guardrails keep it that way:
-
-| Guard | Where | What it does |
-|---|---|---|
-| `CLIP_SECONDS` | `scripts/config.sh` | How much of each episode to transcribe |
-| `MONTHLY_TRANSCRIBE_SECONDS` | DynamoDB atomic counter | Hard refusal once the month's budget is spent |
-| `MAX_EPISODES_PER_POLL` | `src/shared/common.py` | Stops a 400-episode back catalogue flooding the queue |
-| AWS Budgets | `02-core.yaml` | Emails you at 50% of $5, and on any forecast overrun |
-
-To transcribe whole episodes, set `CLIP_SECONDS=0` — and read
-[docs/COSTS.md](docs/COSTS.md) first.
-
----
+Accounts are invitation-only. All operators share one personal workspace; this
+is not a tenant-isolated service. Audio uploads continue through the CLI.
+Browser uploads, Comprehend topic extraction and cross-transcript indexing are
+not implemented.
 
 ## Layout
 
-```
-infrastructure/
-  01-auth.yaml     Cognito user pool + hosted sign-in UI
-  02-core.yaml     DynamoDB, S3, SQS, SNS, 5 Lambdas, HTTP API, alarms, budget
-  03-web.yaml      Private S3 bucket + CloudFront with Origin Access Control
-src/
-  api/handler.py         All HTTP routes behind the JWT authorizer
-  pipeline/poller.py     Scheduled: find new episodes, fan out to SQS
-  pipeline/processor.py  SQS consumer: clip → S3 → start Transcribe
-  pipeline/completer.py  EventBridge: Transcribe done → Comprehend → index
-  digest/weekly.py       Weekly SNS email
-  shared/                DynamoDB access patterns, RSS parser
-web/                     Vanilla JS single-page app, no build step
-scripts/                 deploy, create-user, poll-now, status, logs, teardown
-docs/                    Architecture notes, exam mapping, cost breakdown
-```
-
-## Scripts
-
-| Command | What it does |
+| Location | Purpose |
 |---|---|
-| `./scripts/deploy.sh` | Deploy or update everything. Safe to re-run. |
-| `./scripts/create-user.sh EMAIL` | Create a Cognito login |
-| `./scripts/seed-feed.sh URL EMAIL` | Add a feed without opening the browser |
-| `./scripts/poll-now.sh` | Trigger the poller immediately |
-| `./scripts/status.sh` | Pipeline health: episode states, budget, DLQ depth |
-| `./scripts/logs.sh processor` | Tail one Lambda's logs |
-| `./scripts/teardown.sh` | Delete all of it |
+| `web/` | Preserved visual design, updated for the deployed pipeline |
+| `backend/` | Pipeline, CLI, original tests and the new dashboard API/tests |
+| `infrastructure/web.json` | Companion CloudFront/private S3 site, Cognito, HTTP API and API Lambda |
+| `scripts/deploy.sh` | Deploy the dashboard against an existing pipeline |
+| `scripts/create_user.py` | Invite a trusted operator |
+| `tests/test_dashboard.py` | Browser checks with mocked HTTP services |
+| `legacy/` | Preserved original unused backend; excluded from deployment |
+
+The API reads the existing episode table and transcript bucket and invokes the
+existing scanner. It does not create a second episode table, queue or worker.
+The original pipeline template and processing modules remain unchanged.
+
+## Connect the website
+
+In CloudShell, use a non-root administrative login in the pipeline's region.
+While the pull request is open:
+
+```bash
+git clone --branch codex/deployed-backend-2026-11-08 https://github.com/sarajmcghee/podcastlens.git podcastlens-review
+cd podcastlens-review
+bash scripts/deploy.sh podcast-lense-dev us-east-1
+```
+
+This creates or updates **`podcast-lense-dev-web`**, reads the pipeline outputs,
+packages the API, generates frontend configuration and publishes the site.
+CloudFront provisioning can take several minutes. The command prints the site URL.
+
+The deployment uses the existing pipeline and data. It does not redeploy the
+pipeline, enable feed scheduling or deploy the old backend. It creates billable
+website/authentication/API resources and uses the existing artifact bucket and
+alarm topic.
+
+Invite your operator login:
+
+```bash
+python3 scripts/create_user.py your-email@example.com podcast-lense-dev us-east-1
+```
+
+New users receive a Cognito invitation email. Open the printed website URL,
+sign in, set the requested password and inspect an existing recording.
+Only invite people who should read all recordings and manage feeds.
+
+A GitHub push or merge does not deploy to AWS. CI has no deployment job or AWS
+credentials. Run the deployment command to apply the integration.
+
+## First live checks
+
+1. Open the website signed out; recordings must not be visible.
+2. Sign in with the invited operator and find an existing completed recording.
+3. Read its transcript and search for a recorded word.
+4. Compare status and reserved seconds with the CLI.
+5. Confirm an API request without a token is rejected.
+6. Save a permitted feed, request a scan and observe the existing pipeline.
+7. Sign out and confirm recordings and transcript text disappear.
+
+These are pending until performed in AWS. Backend test results do not establish
+that the new Cognito/API/CloudFront integration has been deployed.
 
 ## Tests
 
 ```bash
-python3 tests/test_processor.py
+cd backend
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m pytest -q
+.venv/bin/cfn-lint template.json ../infrastructure/web.json
+cd ..
 ```
 
-Ten tests covering the clip-sizing and byte-limiting logic — the parts that
-decide how much audio, and therefore how much money, each episode costs. They
-stub out boto3, so they run offline with no credentials and no charges.
+Browser checks intercept HTTP requests and use no AWS credentials:
 
-## Study material
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-web-dev.txt
+.venv/bin/python -m playwright install chromium
+.venv/bin/python tests/test_dashboard.py
+```
 
-- [docs/CONSOLE-TOUR.md](docs/CONSOLE-TOUR.md) — where every piece of this shows
-  up in the AWS Console, and why EC2 is empty
-- [docs/EXAM-MAP.md](docs/EXAM-MAP.md) — every service here mapped to the SAA-C03
-  exam domains, with the specific question patterns each one shows up in
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — why each design decision went
-  the way it did, and what you would do differently at scale
-- [docs/COSTS.md](docs/COSTS.md) — line-by-line free tier accounting
+Set `CHROMIUM_EXECUTABLE` only for an existing compatible Chromium binary.
+CI also runs the preserved original backend tests separately.
 
-The templates themselves are written to be read. Every resource carries a
-comment explaining not just what it is but why it is shaped that way.
+## Operations and cleanup
+
+See the [backend walkthrough](backend/docs/START_HERE.md),
+[acceptance checks](backend/docs/ACCEPTANCE_TESTS.md) and
+[runbook](backend/docs/RUNBOOK.md). The default admission cap is 600 reserved
+transcription seconds per UTC month. This is not a cap on the total AWS bill;
+storage, requests, logs, alarms and the website can incur charges.
+
+The API has a separate Lambda error alarm on the existing SNS topic.
+Feed configuration is shared with the CLI. Conditional writes prevent silently
+overwriting concurrent configuration edits. Removing a feed preserves recordings.
+
+To remove only the dashboard, save needed information, empty its site bucket
+and delete the companion web stack. Its Cognito pool is protected and retained,
+so deleting login accounts is a separate deliberate operation. The pipeline
+and its data remain. Remove only the `PIPELINE_STACK/web-api/` artifact prefix
+when it is no longer needed. Use the backend runbook for pipeline cleanup.

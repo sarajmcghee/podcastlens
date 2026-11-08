@@ -91,6 +91,17 @@ input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   padding: .12rem .4rem; border-radius: 4px; border: 1px solid currentColor;
 }
 .badge.READY { color: var(--ok); }
+.badge.COMPLETED { color: var(--ok); }
+.badge.QUEUED, .badge.SUBMITTING, .badge.PROCESSING { color: var(--warn); }
+.badge.BLOCKED_BUDGET { color: var(--err); }
+.section-heading { justify-content: space-between; align-items: center; }
+.section-heading h2 { margin: 0; }
+.transcript { white-space: pre-wrap; overflow-wrap: anywhere; }
+#feed-form label { display: block; margin-top: .7rem; margin-bottom: .25rem; }
+#feed-form input { width: 100%; }
+#more-btn { margin-top: 1rem; }
+button:disabled { opacity: .55; cursor: wait; }
+@media (max-width: 540px) { .bar { align-items: flex-start; } .bar-right { flex-direction: column; align-items: flex-end; } }
 .badge.TRANSCRIBING, .badge.DOWNLOADING, .badge.NEW { color: var(--warn); }
 .badge.FAILED, .badge.TOO_LARGE, .badge.BUDGET_SKIPPED { color: var(--err); }
 .results { display: grid; gap: .6rem; margin-top: .9rem; }
